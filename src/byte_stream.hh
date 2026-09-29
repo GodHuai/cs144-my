@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 class Reader;
 class Writer;
@@ -23,6 +24,12 @@ public:
 
 protected:
   // Please add any additional state to the ByteStream here, and not to the Writer and Reader interfaces.
+  std::vector<char> buffer_;
+  size_t head_=0;
+  size_t tail_=0;
+  size_t read_count_=0;
+  size_t write_count_=0;
+  bool closed_=false;
   uint64_t capacity_;
   bool error_ {};
 };
