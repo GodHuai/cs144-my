@@ -2,11 +2,16 @@
 
 #include "byte_stream.hh"
 
+#include <map>
+#include <optional>
+
 class Reassembler
 {
 public:
   // Construct Reassembler to write into given ByteStream.
-  explicit Reassembler( ByteStream&& output ) : output_( std::move( output ) ) {}
+  explicit Reassembler( ByteStream&& output )
+    : output_( std::move( output ) ), buffer_ {}, capacity_( output_.capacity() )
+  {}
 
   /*
    * Insert a new substring to be reassembled into a ByteStream.
@@ -42,4 +47,8 @@ public:
 
 private:
   ByteStream output_; // the Reassembler writes to this ByteStream
+  std::map<uint64_t, std::string> buffer_; // 起点 -> 连续字节；区间互不重叠且尽量合并
+  uint64_t capacity_;                      // 输出 ByteStream 的总容量
+  uint64_t pending_bytes_ {};              // buffer_ 中唯一、尚未写入流的字节数
+  std::optional<uint64_t> eof_index_ {};   // 最后一个片段的结束下标（开区间）
 };
