@@ -1,34 +1,45 @@
 Checkpoint 3 Writeup
 ====================
 
-My name: [your name here]
+My name: [fill in]
+My SUNet ID: [fill in, if applicable]
+I collaborated with: [fill in]
+This checkpoint took me about [fill in] hours.
 
-My SUNet ID: [your sunetid here]
+Program Structure and Design
+----------------------------
 
-I collaborated with: [list sunetids here]
+TCPSender tracks the first unacknowledged absolute sequence number and
+the first unsent absolute sequence number. The receiver's advertised
+window gives the right edge for push(). A zero-size window is treated
+as one only while deciding whether push() can send a probe.
 
-I would like to thank/reward these classmates for their help: [list sunetids here]
+Each new segment is as large as the remaining window and payload limit
+allow. SYN and FIN each consume one sequence number. Segments that
+consume sequence numbers are retained in a deque with their absolute
+end positions. A segment stays outstanding until an ACK passes its end,
+even if the ACK partially covers it. The in-flight counter follows
+this full-segment convention.
 
-This checkpoint took me about [n] hours to do. I [did/did not] attend the lab session.
+One timer protects the oldest outstanding segment. New segments do not
+restart it. A new valid ACK resets the RTO and retransmission count,
+and restarts the timer if any segment remains outstanding. A timeout
+resends the oldest segment. The RTO doubles and the retry count rises
+only when the receiver advertises a nonzero window.
 
-Program Structure and Design of the TCPSender [Describe data
-structures and approach taken. Describe alternative designs considered
-or tested.  Describe benefits and weaknesses of your design compared
-with alternatives -- perhaps in terms of simplicity/complexity, risk
-of bugs, asymptotic performance, empirical performance, required
-implementation time and difficulty, and other factors. Include any
-measurements if applicable.]: []
+Implementation Challenges
+-------------------------
 
-Implementation Challenges:
-[]
+The key distinction was between ACK advancement and complete segment
+acknowledgment. A partial ACK moves the window's left edge but leaves
+the original segment in the retransmission queue. This also matters
+when a FIN is waiting for one more sequence number of window space.
+The timer uses only tick() input and preserves the oldest segment's
+deadline when later segments are sent.
 
-Remaining Bugs:
-[]
+Remaining Bugs
+--------------
 
-- Optional: I had unexpected difficulty with: [describe]
-
-- Optional: I think you could make this lab better by: [describe]
-
-- Optional: I was surprised by: [describe]
-
-- Optional: I'm not sure about: [describe]
+None known after check3 passed all 36 tests using clang++ on UTM.
+A separate partial-ACK check also verified full-segment accounting
+and retransmission of the original segment.
