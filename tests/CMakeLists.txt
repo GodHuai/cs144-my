@@ -67,5 +67,11 @@ add_test_exec(send_ack)
 add_test_exec(send_close)
 add_test_exec(send_extra)
 
+add_executable(quic_varint_sanitized EXCLUDE_FROM_ALL quic_varint.cc)
+target_compile_options(quic_varint_sanitized PUBLIC ${SANITIZING_FLAGS})
+target_link_options(quic_varint_sanitized PUBLIC ${SANITIZING_FLAGS})
+target_link_libraries(quic_varint_sanitized quic_sanitized)
+add_dependencies(functionality_testing quic_varint_sanitized)
+
 add_speed_test(byte_stream_speed_test)
 add_speed_test(reassembler_speed_test)

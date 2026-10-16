@@ -53,6 +53,7 @@ ttest(send_window)
 ttest(send_ack)
 ttest(send_close)
 ttest(send_extra)
+ttest(quic_varint)
 
 ttest(net_interface)
 
