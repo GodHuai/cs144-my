@@ -1,61 +1,32 @@
-# Minnow 上的 QUIC v1 实现提案（待纳入 specjc）
+# Minnow 完整实现 QUIC v1：提案
 
-状态：待评审的普通项目提案。当前没有任务号，因此本变更不冒充 `specjc:propose` 产物；相关行为要求、设计和任务计划分别见同目录文件。
+状态：待评审的普通项目提案。没有任务号与已发布的 explore，故不冒充正式 `specjc:refine-propose` 产物。
 
-## 背景与目标
+## 目标
 
-在 Minnow 已完成的 ByteStream、Reassembler、TCPReceiver 和 TCPSender 实验基础上，实现基于 UDP 的 QUIC v1 传输。目标是让本项目的客户端与服务端建立受 TLS 1.3 保护的连接，在多条双向流上可靠传输字节，并与至少一种独立 QUIC v1 实现完成互通验证。目标协议由 RFC 9000（传输）、RFC 9001（TLS 集成）和 RFC 9002（丢包恢复与拥塞控制）定义。
+在 Minnow 基础上实现独立的 QUIC v1 客户端和服务端，最终逐项满足 RFC 9000、RFC 9001、RFC 9002 中适用于双方的规范性要求，并与独立 QUIC v1 实现双向互通。中间里程碑可以有缺项；只有覆盖矩阵全部核验后才称“完整实现”。
 
-实现以新 `quic/` 模块组织，保留现有 TCP 实验代码。`ByteStream` 和 `Reassembler` 可作为每条流的缓冲与乱序重组基础；UDP socket、事件循环和测试框架可继续使用。TCP 的 SYN/FIN 序号、累计 ACK、单一连接级字节流及报文段重传状态机不能直接代表 QUIC 的包、帧和流语义。
+复用 `ByteStream`、`Reassembler`、`UDPSocket` 和事件循环；新建 QUIC 协议模块。TCP 的序号、累计 ACK 和报文段重传状态机不作为 QUIC 实现。现有 TCP 实验和测试保留。
 
-## 第一轮范围
+## 完成范围
 
-1. QUIC v1 客户端与服务端；Initial、Handshake、1-RTT 包及其加解密、包头保护、包号空间、连接 ID 和必要的传输参数。
-2. TLS 1.3 握手与 CRYPTO 帧；证书验证、密钥更新和握手失败处理按 RFC 9001 设计，使用具备 QUIC 集成能力的成熟 TLS 库。先通过技术探针固定库及版本。
-3. 必需的帧编码/解析及协议校验：ACK、CRYPTO、STREAM、PING、PADDING、MAX_DATA、MAX_STREAM_DATA、MAX_STREAMS、连接关闭等；按实际状态补充 RESET_STREAM、STOP_SENDING、阻塞提示及路径验证帧。
-4. 多条双向流：Stream ID 与 offset、乱序与重复数据、FIN/final size、每流和连接级流量控制，以及并发流上限。
-5. RFC 9002 的 RTT 估计、ACK 范围处理、丢包判定、PTO、bytes-in-flight 与拥塞窗口；丢失信息在新包中重新发送，包号不复用。
-6. 连接建立、空闲超时、正常关闭、错误关闭及对无效包/帧的处理；地址验证与反放大限制。
+1. **RFC 9000 传输**：版本协商、Initial/Handshake/0-RTT/1-RTT/Retry、包与全部基础帧、三类包号空间、连接 ID、传输参数、单向与双向流、流状态、流/连接级流量与并发控制、ACK、重置、地址验证、反放大、路径验证、主动迁移、PMTU、ECN、关闭与 stateless reset。
+2. **RFC 9001 安全**：TLS 1.3、CRYPTO 帧、证书与 ALPN、Initial secret、包加密和包头保护、0-RTT 票据及接受/拒绝、密钥更新与丢弃、错误映射。采用成熟 TLS/密码库；本项目负责 QUIC 集成。0-RTT 应用数据仅用于显式定义了重放安全规则的应用协议；互通适配层限定为只读 GET。
+3. **RFC 9002 恢复**：ACK 范围、RTT、包/时间阈值丢包判定、PTO、慢启动、拥塞避免、恢复期、持续拥塞、bytes-in-flight、ECN 与发送节奏。丢失信息用新包号重新发送。
+4. **互通与解释**：本项目客户端和服务端都与独立实现验证；完成后根据最终源码逐项对照 RFC 写详细实现讲解。
 
-首轮暂不实现 0-RTT、HTTP/3、QUIC v2、主动连接迁移和性能优化。任何未实现的可选特性必须通过协商或显式拒绝处理；不能把未加密的自定义 UDP 协议称为 QUIC v1。
+“完整”包括上述规范的强制要求，以及实现并宣称支持的条件/可选机制的相关要求。`coverage.md` 跟踪条款、实现位置和证据。HTTP/3、QUIC v2、RFC 9221 DATAGRAM、WebTransport 等另属应用协议或扩展，不在 QUIC v1 核心范围内。IPv4 与 IPv6 均纳入验证。
 
-## 可观察行为与验收
+## 验收
 
-- 客户端和服务端在 UDP loopback 上完成 QUIC v1 + TLS 1.3 握手；错误证书、无效认证标签和非法状态转换不会被接受。
-- 建立连接后，至少两条双向流能并发传输不同长度的数据；一条流乱序或丢包不会阻止另一条已有完整数据的流向应用交付。
-- 接收端按 Stream ID 和 offset 组装数据；重复数据不重复交付；FIN 的最终长度一致性得到校验，冲突时按协议关闭连接。
-- 发送端不会超出对端公布的流级或连接级额度；接收端能在应用消费数据后更新额度，违规数据触发正确的传输错误。
-- 在可控的丢包、乱序、重复和延迟场景中，ACK 范围、PTO、丢包恢复与拥塞控制使传输最终完成，并保持数据一致。
-- 至少完成一次与独立 QUIC v1 实现的客户端或服务端互通测试，记录版本、握手、流传输、关闭及抓包/日志证据。
-- 现有 Minnow TCP 实验测试继续通过；QUIC 单元和集成测试纳入 CMake。
+- 双端与独立实现分别完成握手、1-RTT/0-RTT、Retry、多流、流量控制、恢复、迁移和关闭的适用测试；对端不支持的功能由可复现协议测试补足。互通采用 QUIC Interop Runner 的 HTTP/0.9 测试适配层及其约定的 ALPN、证书和文件传输格式；HTTP/0.9 只用于验证传输，不扩大 QUIC 核心范围。
+- 可控注入丢包、乱序、重复、延迟、路径及 MTU 变化、ECN、非法包与错误证书，验证数据一致性、安全边界、反放大和拥塞上限。
+- RFC 9000/9001/9002 规范性条款的覆盖矩阵全部有代码与测试处置；互通成功不能替代异常路径测试。
+- 新测试集成 CMake，现有 Minnow TCP 测试继续通过；解析器接受模糊测试。
+- 完成 `implementation.md`，用实际源码和测试证据解释数据结构、状态机、UDP→流交付、TLS/0-RTT、ACK/PTO→重发、迁移及每项 RFC 对应关系。
 
-## 技术设计要点
+## 交付与风险
 
-- 分层：UDP I/O → QUIC 包编解码/加密 → 连接与恢复 → 流管理 → 应用 API。编解码对畸形长度、整数溢出、保留位和未知帧采取协议规定的行为。
-- 每条接收流持有独立 `Reassembler`。`STREAM` 帧的 offset 直接映射到 `Reassembler::insert` 的 `first_index`；FIN 映射到 final size，但在调用前检查所有已知 final size、流量控制和流状态。
-- 发送流以单独的字节 offset 跟踪已发送、已确认和待重发范围。包号属于包号空间，不作为流字节下标。
-- 包级 ACK/丢包状态与流级字节状态分离。一个包可承载多帧；丢包后在新的包号下重新封装仍需发送的信息。
-- 加密材料、证书及随机数通过 TLS/密码库管理，避免手写 TLS 协议或密码原语。
+按 `tasks.md` 分阶段实施，最终全量审计。首个阻点是 TLS 库的 QUIC API、会话恢复和构建方式：虚拟机目前仅确认有 OpenSSL 3.0.13 命令；BoringSSL QUIC API 是技术探针候选。现有 UDP/地址封装还需扩展 IPv6 与 ECN，现有 Reassembler 需建立“公布额度内绝不裁掉已 ACK 数据”的接收缓冲约束。完整协议显著超出当前三个 Minnow 实验，单次握手或单流演示不算完成。
 
-## 实施任务建议
-
-1. 建立 CMake 模块、QUIC 类型、变长整数和帧/包解析的单元测试。
-2. 接入 TLS 库，实现 Initial/Handshake/1-RTT 保护及客户端/服务端握手测试。
-3. 实现连接状态、单条流收发及关闭；复用并验证 `ByteStream`/`Reassembler` 的行为边界。
-4. 实现 ACK、RTT、丢包恢复、PTO 和拥塞控制，加入可控网络故障测试。
-5. 扩展为多流、流量控制和并发限制；加入无队头阻塞与异常帧测试。
-6. 补齐连接生命周期、安全边界、外部互通测试及性能基线。
-7. 代码实现和验证完成后，编写详细实现文档：逐项对照 RFC 9000/9001/9002 的章节、对应代码位置、状态机与数据结构、关键路径示例、测试证据、已支持和未支持的特性，并解释 Minnow 原有组件如何复用或改造。
-
-## 待在正式 explore/design 中确认
-
-- 真实父/子任务号、目标基线分支和 worktree 路径。
-- 第一轮是否以“可互通的 QUIC v1 最小实现”为目标；若范围不同，需调整拆分与验收。
-- 虚拟机可安装或已具备的 QUIC TLS 库及独立互通实现；当前只确认有 OpenSSL 3.0.13 命令，尚未确认开发库/API。
-- 客户端与服务端应用 API 的形态、证书/测试密钥的存放方式，以及是否需要支持 IPv6。
-
-## 规范来源
-
-- RFC 9000: https://www.rfc-editor.org/rfc/rfc9000.html
-- RFC 9001: https://www.rfc-editor.org/rfc/rfc9001.html
-- RFC 9002: https://www.rfc-editor.org/rfc/rfc9002.html
+来源：[RFC 9000](https://www.rfc-editor.org/rfc/rfc9000.html)、[RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html)、[RFC 9002](https://www.rfc-editor.org/rfc/rfc9002.html)、[QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner/blob/master/quic.md)。

@@ -1,46 +1,21 @@
-# QUIC v1 设计草案
+# 完整 QUIC v1 设计草案
 
-## 基线与架构
+基线：Minnow `my-work`，提交 `7d30f0b7b1545ef997005440fb5be3b1e90f7e6e`。新增独立 `quic/` 库；扩展现有 UDP/地址接口后提供 IPv4/IPv6 I/O，`EventLoop` 负责事件；`ByteStream`/`Reassembler` 仅提供每流字节缓存与重组。
 
-基线：Minnow `my-work`，提交 `7d30f0b7b1545ef997005440fb5be3b1e90f7e6e`。新增独立 `quic/` 库和示例客户端/服务端，保留 TCP 实验。现有 `UDPSocket`、`EventLoop` 提供 I/O 基础；`ByteStream` 和 `Reassembler` 用于每条流的数据缓存与重组。
+## 模块与状态
 
-建议依赖关系：
+UDP I/O → 包解析/保护 → 连接/TLS → 帧调度与恢复 → 流/API。认证和合法性检查先于状态更新及应用交付。连接拥有角色、连接 ID、路径、握手/关闭状态、传输参数、三类包号空间、流表及定时器。0-RTT 和 1-RTT 共享 Application Data 包号空间。
 
-```text
-应用 API → QUIC 连接/流 → 帧调度、流量控制、恢复 → 包编解码/保护 → UDP socket
-                                 ↕
-                           TLS 1.3 适配层
-```
+每流记录方向、offset、final size、额度、收发状态、待确认/恢复区间与独立 `Reassembler`。STREAM 数据进入 Reassembler 前先检查流状态、权限、最终长度和流/连接额度。连接额度按各流最高接收偏移变化计量。每流发布的 `MAX_STREAM_DATA` 上限始终不大于 `bytes_popped + Reassembler capacity`；应用消费后再增加额度。接收层必须确认额度内的全部字节已保存，才可 ACK 该包；若 Reassembler 仍会裁剪，须改为无损存储或修正窗口实现。现有 Reassembler 的冲突重叠和提前 FIN 行为须先测试，再决定适配或修正。并发流上限与缓冲预算共同约束总内存。
 
-## 关键状态
+发送调度器从 CRYPTO、流、ACK、额度与路径控制队列组帧，再按密钥级别、PMTU、反放大与拥塞窗口组包。每包记录包号、时间、大小及可恢复信息；ACK/丢包更新包状态，仍需可靠送达的信息重新入队。Recovery 分空间管理包和丢包状态，共享 RTT/拥塞估计。
 
-- **Connection**：角色、连接 ID、握手/关闭状态、传输参数、三个包号空间、流表、连接流量额度和定时器。
-- **Packet number space**：下一个发送包号、已接收包号区间、待确认区间、已发送包元数据。包号只标识包，不作为流的字节偏移。
-- **Stream**：方向、发送 offset、接收 `Reassembler`、final size、已发送/确认/待恢复字节区间、每流额度和状态。
-- **Recovery**：RTT 估计、PTO、丢包阈值、拥塞窗口、bytes-in-flight。ACK 更新包状态，并将仍需传输的帧信息交回调度器。
-- **TLS adapter**：消费/产出 CRYPTO 数据、提供读写密钥和加密级别、传输参数及证书结果；包保护和 TLS 握手状态不混入 TCP 类。
+路径状态包含地址、验证、PMTU、ECN 与适用的 RTT/拥塞信息。迁移执行挑战/响应，更新连接 ID；按照 RFC 9000 §9.4 对新路径重置或保留拥塞/恢复状态，不能机械沿用旧路径估计。旧路径数据不能误验证新路径。连接状态机覆盖版本协商、Retry、握手确认、密钥丢弃、空闲、关闭、draining、stateless reset。
 
-## 复用与边界
+TLS 使用成熟库，先验证 BoringSSL 的 QUIC callback、证书验证、会话恢复、密钥更新与构建许可证，再固定版本。QUIC 侧实现包保护、CRYPTO 重组和传输参数集成；不手写 TLS 或密码原语。0-RTT API 默认禁止应用数据，只有应用协议配置了可重放操作并明确请求才放行；互通适配层的 profile 只允许只读 HTTP/0.9 GET。拒绝时服务端不处理早期包，客户端重置所有流及关联应用状态并通知应用，仅由应用按重放安全策略发起新的 1-RTT 操作。服务端检查恢复配置并执行重放防护。
 
-`Reassembler::insert(offset, data, fin)` 与 STREAM 帧的 offset/data/FIN 接近，但它只处理字节重组。调用前要在 QUIC 层校验流 ID、状态、final size、流量额度、重复范围和总连接额度。若现有 Reassembler 对冲突片段或终止条件的行为与 RFC 不符，应扩展适配层或在独立分支修正并补测试。
+当前 `UDPSocket` 和 `Address` 仅面向 IPv4，且 `recvfrom`/`sendto` 不携带 ECN 元数据。新增可表达 IPv4/IPv6 的地址和数据报类型，通过 `recvmsg`/`sendmsg` 及 IP_TOS/IPV6_TCLASS 等控制消息收发 ECN；先写回环探针，再接入 QUIC 路径/ECN 状态。
 
-TLS 计划优先验证具有 QUIC 握手回调的成熟库。BoringSSL 提供 `SSL_set_quic_method` 与传输参数 API，可作为首选技术验证对象；虚拟机当前只确认有 OpenSSL 3.0.13 命令，尚未确认可用于本项目的 QUIC TLS 开发接口。先做最小握手探针并固定依赖版本、许可证和构建方式，再锁定设计。不能手写 TLS 或自行设计密码协议。
+验证采用编解码/状态单元测试、确定性虚拟网络、IPv4/IPv6 端到端、解析器模糊测试及 RFC 覆盖审计。独立实现互通采用 QUIC Interop Runner 约定的 HTTP/0.9 测试适配层、ALPN `hq-interop`、证书和文件传输格式；该适配层只服务测试。主要风险是 TLS/0-RTT、迁移路径状态、流量额度和跨包号空间恢复，每项独立设失败测试。
 
-## 首轮不包含的能力
-
-0-RTT、HTTP/3、QUIC v2、主动迁移和性能调优分别作为后续变更。对方发来相关帧或参数时，按 RFC 判断可忽略、拒绝还是关闭连接；不可一概静默丢弃。首轮最终支持清单以互通测试结果为准。
-
-## 主要风险与处理
-
-1. **TLS 库集成**：握手密钥回调、证书验证与包保护跨层；先完成可独立运行的握手探针。
-2. **范围膨胀**：将编解码、安全握手、单流、恢复、多流、互通作为顺序交付点，每个交付点保留可运行测试。
-3. **流量控制记账**：连接额度按各流最高已接收 offset/final size 计量，不能按重复收到的字节数累加；用重复、乱序和 RESET 场景测试。
-4. **恢复状态交叉**：包确认与流字节确认分离，测试同一数据由两个不同包号承载时的 ACK/丢包顺序。
-5. **安全边界**：模糊输入、长度溢出、无效认证标签与反放大限制由解析/连接层集中检查。
-
-## 参考
-
-- [RFC 9000：QUIC 传输](https://www.rfc-editor.org/rfc/rfc9000.html)
-- [RFC 9001：TLS 集成](https://www.rfc-editor.org/rfc/rfc9001.html)
-- [RFC 9002：丢包恢复与拥塞控制](https://www.rfc-editor.org/rfc/rfc9002.html)
-- [BoringSSL QUIC API](https://boringssl.googlesource.com/boringssl/+/main/include/openssl/ssl.h)
+参考：[RFC 9000](https://www.rfc-editor.org/rfc/rfc9000.html)、[RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html)、[RFC 9002](https://www.rfc-editor.org/rfc/rfc9002.html)、[BoringSSL QUIC API](https://boringssl.googlesource.com/boringssl/+/main/include/openssl/ssl.h)。
