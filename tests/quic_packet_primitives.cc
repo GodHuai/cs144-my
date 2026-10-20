@@ -1,5 +1,6 @@
 #include "quic/header_protection.hh"
 #include "quic/packet_number.hh"
+#include "quic/packet_number_space.hh"
 #include "quic/rtt_estimator.hh"
 
 #include <array>
@@ -9,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 using namespace quic;
 
@@ -120,4 +122,63 @@ int main()
     rejected = true;
   }
   require( rejected, "negative RTT accepted" );
+
+  // RFC 9000 §12.3: Initial and Handshake each have a space; 0-RTT and 1-RTT share one.
+  static_assert( !std::is_copy_constructible_v<PacketNumberSpaces> );
+  static_assert( !std::is_move_constructible_v<PacketNumberSpaces> );
+  PacketNumberSpaces spaces;
+  require( packet_number_space( PacketKind::Initial ) == PacketNumberSpaceId::Initial, "Initial space" );
+  require( packet_number_space( PacketKind::Handshake ) == PacketNumberSpaceId::Handshake, "Handshake space" );
+  require( packet_number_space( PacketKind::ZeroRtt ) == PacketNumberSpaceId::Application,
+           "0-RTT application space" );
+  require( packet_number_space( PacketKind::OneRtt ) == PacketNumberSpaceId::Application,
+           "1-RTT application space" );
+  require( spaces.allocate( PacketKind::Initial ) == 0 && spaces.allocate( PacketKind::Handshake ) == 0,
+           "independent first send numbers" );
+  require( spaces.allocate( PacketKind::ZeroRtt ) == 0 && spaces.allocate( PacketKind::OneRtt ) == 1,
+           "0-RTT and 1-RTT share send sequence" );
+  require( spaces.allocate( PacketKind::Initial ) == 1, "Initial send number reused" );
+
+  require( spaces.record_authenticated( PacketKind::Initial, 5 ), "first Initial received" );
+  require( !spaces.record_authenticated( PacketKind::Initial, 5 ), "duplicate Initial received" );
+  require( spaces.record_authenticated( PacketKind::Handshake, 5 ), "same number in Handshake rejected" );
+  require( spaces.record_authenticated( PacketKind::ZeroRtt, 5 ), "first application number received" );
+  require( !spaces.record_authenticated( PacketKind::OneRtt, 5 ), "0-RTT number replayed in 1-RTT" );
+  require( spaces.record_authenticated( PacketKind::OneRtt, 3 ), "reordered application number rejected" );
+  require( spaces.record_authenticated( PacketKind::OneRtt, 4 ), "gap-filling application number rejected" );
+  require( !spaces.record_authenticated( PacketKind::ZeroRtt, 4 ), "merged range lost duplicate" );
+  require( spaces.largest_received( PacketKind::OneRtt ) == 5, "application largest received" );
+  require( spaces.largest_received( PacketKind::Initial ) == 5, "Initial largest received" );
+  require( spaces.largest_received( PacketKind::Handshake ) == 5, "Handshake largest received" );
+
+  spaces.retire_received_below( PacketKind::OneRtt, 4 );
+  require( !spaces.record_authenticated( PacketKind::ZeroRtt, 3 ), "retired application number accepted" );
+  require( !spaces.record_authenticated( PacketKind::OneRtt, 4 ), "retained duplicate accepted" );
+  spaces.retire_received_below( PacketKind::OneRtt, 2 );
+  require( !spaces.record_authenticated( PacketKind::OneRtt, 3 ), "retirement floor moved backwards" );
+  require( spaces.record_authenticated( PacketKind::OneRtt, 6 ), "new application number rejected" );
+  require( spaces.largest_received( PacketKind::ZeroRtt ) == 6, "shared largest received" );
+  require( !spaces.record_authenticated( PacketKind::Initial, max_packet_number + 1 ),
+           "62-bit receive limit ignored" );
+  spaces.retire_received_below( PacketKind::Initial, 6 );
+  require( !spaces.record_authenticated( PacketKind::Initial, 5 ), "Initial retirement failed" );
+  require( spaces.largest_received( PacketKind::Initial ) == 5, "retirement reset decoding reference" );
+  require( spaces.record_authenticated( PacketKind::Handshake, max_packet_number ),
+           "largest valid received packet number rejected" );
+  require( !spaces.record_authenticated( PacketKind::Handshake, max_packet_number ),
+           "largest packet-number duplicate accepted" );
+  rejected = false;
+  try {
+    spaces.retire_received_below( PacketKind::Handshake, max_packet_number + 2 );
+  } catch ( const std::out_of_range& ) {
+    rejected = true;
+  }
+  require( rejected, "retirement floor above packet-number space accepted" );
+  rejected = false;
+  try {
+    packet_number_space( static_cast<PacketKind>( 255 ) );
+  } catch ( const std::invalid_argument& ) {
+    rejected = true;
+  }
+  require( rejected, "invalid packet kind mapped to a space" );
 }
