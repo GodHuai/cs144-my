@@ -1,6 +1,8 @@
-# RFC 覆盖矩阵（提案阶段）
+# QUIC v1 RFC 覆盖矩阵（进行中）
 
 当前只有表中标明的基础函数部分实现。后续须逐条展开 MUST/MUST NOT/SHOULD，记录条款 ID、角色/适用条件、实现或 N/A 理由、源码、测试和互通证据；本表只是目录，不代表已符合 RFC。特别审计 0-RTT 拒绝及只读 GET profile、无损接收/ACK、迁移、preferred_address、AEAD 限制和数据报大小。
+
+状态读法：“计划”表示没有对应完整实现；“部分实现”仅表示表格指出的函数及测试已经存在，**不表示该范围其余要求已满足**。逐模块解释与学习顺序见 [README.md](README.md) 和 [implementation.md](implementation.md)。
 
 | 规范 | 主题 | 任务 | 状态 |
 | --- | --- | --- | --- |

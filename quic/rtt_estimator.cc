@@ -59,8 +59,9 @@ void RttEstimator::observe( const double latest_rtt_ms,
   if ( latest_rtt_ms >= *min_rtt_ms_ + allowed_ack_delay ) {
     adjusted_rtt -= allowed_ack_delay;
   }
-  smoothed_rtt_ms_ = 0.875 * smoothed_rtt_ms_ + 0.125 * adjusted_rtt;
+  // RFC 9002 erratum 7539: variation compares against the prior smoothed RTT.
   rttvar_ms_ = 0.75 * rttvar_ms_ + 0.25 * abs( smoothed_rtt_ms_ - adjusted_rtt );
+  smoothed_rtt_ms_ = 0.875 * smoothed_rtt_ms_ + 0.125 * adjusted_rtt;
 }
 
 optional<double> RttEstimator::pto_ms( const bool application_data,

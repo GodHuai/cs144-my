@@ -99,7 +99,8 @@ int main()
   near( rtt.rttvar_ms(), 50, "first RTT variation" );
   rtt.observe( 130, 20, false, 25 );
   near( rtt.smoothed_ms(), 101.25, "unconfirmed ACK delay adjustment" );
-  near( rtt.rttvar_ms(), 39.6875, "smoothed RTT variation" );
+  // RFC 9002 verified erratum 7539: compare the sample with the previous smoothed RTT.
+  near( rtt.rttvar_ms(), 40, "RTT variation uses previous smoothed RTT" );
   rtt.observe( 105, 100, true, 25 );
   near( *rtt.min_ms(), 100, "min RTT is not ACK-delay adjusted" );
   near( rtt.smoothed_ms(), 101.71875, "do not adjust below min RTT" );
