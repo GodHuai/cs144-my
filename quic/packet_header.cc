@@ -10,20 +10,95 @@ namespace quic {
 namespace {
 constexpr size_t max_connection_id_length = 20;
 
-bool read_cid( const std::string_view datagram, size_t& cursor, std::string& output )
+bool read_cid( const std::string_view datagram, size_t& cursor, std::string& output, const size_t max_length )
 {
   if ( cursor >= datagram.size() ) {
     return false;
   }
   const size_t length = static_cast<uint8_t>( datagram[cursor++] );
-  if ( length > max_connection_id_length || length > datagram.size() - cursor ) {
+  if ( length > max_length || length > datagram.size() - cursor ) {
     return false;
   }
   output.assign( datagram.substr( cursor, length ) );
   cursor += length;
   return true;
 }
+
+uint32_t read_u32( const std::string_view bytes, size_t& cursor )
+{
+  uint32_t value = 0;
+  for ( size_t i = 0; i < 4; ++i ) {
+    value = ( value << 8 ) | static_cast<uint8_t>( bytes[cursor++] );
+  }
+  return value;
+}
+
+void append_u32( std::string& bytes, const uint32_t value )
+{
+  for ( int shift = 24; shift >= 0; shift -= 8 ) {
+    bytes += static_cast<char>( value >> shift );
+  }
+}
 } // namespace
+
+std::optional<VersionNegotiationPacket> parse_version_negotiation( const std::string_view datagram )
+{
+  if ( datagram.size() < 7 || !( static_cast<uint8_t>( datagram[0] ) & 0x80 ) ) {
+    return std::nullopt;
+  }
+  size_t cursor = 1;
+  if ( read_u32( datagram, cursor ) != 0 ) {
+    return std::nullopt;
+  }
+  VersionNegotiationPacket packet { "", "", {} };
+  if ( !read_cid( datagram, cursor, packet.dcid, 255 ) || !read_cid( datagram, cursor, packet.scid, 255 )
+       || datagram.size() - cursor < 4 || ( datagram.size() - cursor ) % 4 != 0 ) {
+    return std::nullopt;
+  }
+  while ( cursor < datagram.size() ) {
+    packet.supported_versions.push_back( read_u32( datagram, cursor ) );
+  }
+  return packet;
+}
+
+std::string build_version_negotiation( const std::string_view dcid,
+                                       const std::string_view scid,
+                                       const std::vector<uint32_t>& supported_versions,
+                                       const uint8_t unused_bits )
+{
+  if ( dcid.size() > 255 || scid.size() > 255 || supported_versions.empty() || unused_bits > 0x7f ) {
+    throw std::invalid_argument( "invalid Version Negotiation fields" );
+  }
+  std::string result( 1, static_cast<char>( 0x80 | unused_bits ) );
+  append_u32( result, 0 );
+  result += static_cast<char>( dcid.size() );
+  result += dcid;
+  result += static_cast<char>( scid.size() );
+  result += scid;
+  for ( const uint32_t version : supported_versions ) {
+    append_u32( result, version );
+  }
+  return result;
+}
+
+std::optional<RetryPacket> parse_retry_packet( const std::string_view datagram )
+{
+  if ( datagram.size() < 1 + 4 + 1 + 1 + 1 + 16 || ( static_cast<uint8_t>( datagram[0] ) & 0xf0 ) != 0xf0 ) {
+    return std::nullopt;
+  }
+  size_t cursor = 1;
+  if ( read_u32( datagram, cursor ) != 1 ) {
+    return std::nullopt;
+  }
+  RetryPacket packet { "", "", "", "" };
+  if ( !read_cid( datagram, cursor, packet.dcid, max_connection_id_length )
+       || !read_cid( datagram, cursor, packet.scid, max_connection_id_length ) || datagram.size() - cursor <= 16 ) {
+    return std::nullopt;
+  }
+  packet.token.assign( datagram.substr( cursor, datagram.size() - cursor - 16 ) );
+  packet.integrity_tag.assign( datagram.substr( datagram.size() - 16 ) );
+  return packet;
+}
 
 std::optional<PacketLayout> parse_protected_packet( const std::string_view datagram,
                                                     const size_t offset,
@@ -57,10 +132,7 @@ std::optional<PacketLayout> parse_protected_packet( const std::string_view datag
   if ( datagram.size() - cursor < 4 ) {
     return std::nullopt;
   }
-  uint32_t version = 0;
-  for ( size_t i = 0; i < 4; ++i ) {
-    version = ( version << 8 ) | static_cast<uint8_t>( datagram[cursor++] );
-  }
+  const uint32_t version = read_u32( datagram, cursor );
   if ( version != 1 ) {
     return std::nullopt;
   }
@@ -69,7 +141,8 @@ std::optional<PacketLayout> parse_protected_packet( const std::string_view datag
     return std::nullopt;
   }
   PacketLayout layout { static_cast<PacketKind>( type ), version, "", "", "", 0, 0 };
-  if ( !read_cid( datagram, cursor, layout.dcid ) || !read_cid( datagram, cursor, layout.scid ) ) {
+  if ( !read_cid( datagram, cursor, layout.dcid, max_connection_id_length )
+       || !read_cid( datagram, cursor, layout.scid, max_connection_id_length ) ) {
     return std::nullopt;
   }
   if ( type == 0 ) {

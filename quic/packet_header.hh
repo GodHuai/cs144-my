@@ -5,6 +5,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace quic {
 
@@ -32,6 +33,33 @@ struct PacketLayout
   size_t pn_offset;
   size_t packet_end;
 };
+
+// Version Negotiation has version 0 and consumes the entire UDP datagram.
+// Its connection IDs use 8-bit lengths, independent of QUIC v1's 20-byte limit.
+struct VersionNegotiationPacket
+{
+  std::string dcid;
+  std::string scid;
+  std::vector<uint32_t> supported_versions;
+};
+
+std::optional<VersionNegotiationPacket> parse_version_negotiation( std::string_view datagram );
+std::string build_version_negotiation( std::string_view dcid,
+                                       std::string_view scid,
+                                       const std::vector<uint32_t>& supported_versions,
+                                       uint8_t unused_bits = 0x40 );
+
+// Only parses Retry fields. The integrity tag must be verified using RFC 9001
+// Section 5.8 and the original destination CID before a client processes it.
+struct RetryPacket
+{
+  std::string dcid;
+  std::string scid;
+  std::string token;
+  std::string integrity_tag;
+};
+
+std::optional<RetryPacket> parse_retry_packet( std::string_view datagram );
 
 // Parse only fields not obscured by QUIC header protection. The packet-number
 // length and reserved bits are intentionally not checked here.

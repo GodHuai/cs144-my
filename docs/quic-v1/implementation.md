@@ -1,6 +1,6 @@
 # QUIC v1 实现讲解（进行中）
 
-当前完成 RFC 9000 §16 的变长整数、§17.1 的包号编解码、§17.2–17.3 的部分受保护包头布局、§19.1–19.20 的**核心帧线上格式**编解码、RFC 9001 §5.4 的报头掩码基础操作，以及 RFC 9002 §5 的 RTT 估计和 §6.2.1 的 PTO 时长计算。它们还没有组成 QUIC 连接；TLS、AEAD、版本协商与 Retry、ACK 与丢包状态机、UDP 互通仍未完成。扩展帧及逐帧语义也尚未处理。最终以完整协议代码、测试和 `coverage.md` 为准。
+当前完成 RFC 9000 §16 的变长整数、§17.1 的包号编解码、§17.2–17.3 的部分包头布局（包括版本协商和 Retry 的字段解析）、§19.1–19.20 的**核心帧线上格式**编解码、RFC 9001 §5.4 的报头掩码基础操作，以及 RFC 9002 §5 的 RTT 估计和 §6.2.1 的 PTO 时长计算。它们还没有组成 QUIC 连接；TLS、AEAD、Retry 完整性验证、版本协商处理、ACK 与丢包状态机、UDP 互通仍未完成。扩展帧及逐帧语义也尚未处理。最终以完整协议代码、测试和 `coverage.md` 为准。
 
 这份笔记按初学者能逐步手算的顺序编写：每节先说 RFC 规定什么，再解释为什么，最后回到当前 C++ 源码。笔记中的代码片段只摘取决定行为的语句；完整可编译代码以相应 `quic/*.hh`、`quic/*.cc` 和 `tests/quic_*.cc` 为准，避免复制一份会随实现变化而失真的源码。
 
@@ -119,7 +119,7 @@ QUIC 可以把多个长包头包放进同一个 UDP 数据报。要解密其中�
 
 因此 `pn_offset = 18`，`packet_end = 18 + 1182 = 1200`。如果数据报从下标 1200 开始还有字节，可继续解析下一个长包头包；短包头包没有显式 Length，必须放在数据报最后。构造包头的测试直接比对了上面的 RFC 字节，而非只做“自己编码、自己解码”的往返检查。
 
-`quic/packet_header.hh/.cc` 的 `parse_protected_packet()` 从未加密字段读出版本、目的/源连接 ID、Initial Token 和长包头 Length，返回包类型、包号字段起点 `pn_offset` 与包结束位置 `packet_end`。再次以 `packet_end` 为起点调用即可定位下一个拼接的长包头包。短包头的目的连接 ID **没有长度字节**，因此调用者必须从连接状态传入 `short_dcid_length`。两个连接 ID 的 v1 长度均限制为 20 字节；超过界限、字段截断或 Length 超出数据报都拒绝解析。当前接口只接受 v1 Initial、0-RTT、Handshake 和 1-RTT；版本协商包与 Retry 包格式不同，交由后续模块处理。
+`quic/packet_header.hh/.cc` 的 `parse_protected_packet()` 从未加密字段读出版本、目的/源连接 ID、Initial Token 和长包头 Length，返回包类型、包号字段起点 `pn_offset` 与包结束位置 `packet_end`。再次以 `packet_end` 为起点调用即可定位下一个拼接的长包头包。短包头的目的连接 ID **没有长度字节**，因此调用者必须从连接状态传入 `short_dcid_length`。两个连接 ID 的 v1 长度均限制为 20 字节；超过界限、字段截断或 Length 超出数据报都拒绝解析。这个接口只接受 v1 Initial、0-RTT、Handshake 和 1-RTT；版本协商包与 Retry 包使用下面的独立入口。
 
 为什么这里不直接读包号？包号长度写在首字节低两位，但这两位已经被 RFC 9001 的报头保护掩盖。解析器只读首字节的长/短格式、固定位和长包头类型，**不使用低位计算包号长度，也不提前检查保留位**。后续应在 `pn_offset + 4` 取 16 字节样本，生成报头掩码，恢复首字节与包号，再用完整包号解开 AEAD，认证成功后才验证保留位和更新接收状态。为保证样本存在，布局解析器要求从 `pn_offset` 到包末尾至少 20 字节。[RFC 9001 §5.4](https://www.rfc-editor.org/rfc/rfc9001.html#section-5.4)
 
@@ -137,6 +137,22 @@ layout.packet_end = cursor + static_cast<size_t>( *length );
 发送端用 `build_long_header()` 或 `build_short_header()` 构造**尚未保护的**包头和 1–4 字节截断包号。两者都要求调用者提供将来的密文及 AEAD tag 长度 `protected_payload_length`，用它检查样本长度；长包头还会计算 `Length = 包号字节数 + protected_payload_length`。这段未保护包头将来要作为 AEAD 的 associated data；密文生成后才应用报头保护。RFC 9001 附录 A.2 的 Initial 包头 `c3 00 00 00 01 ... 44 9e 00 00 00 02` 是测试向量：包号起点为字节 18，`44 9e` 编出的 Length 为 1182，整个包长为 1200 字节。[RFC 9001 附录 A.2](https://www.rfc-editor.org/rfc/rfc9001.html#appendix-A.2)
 
 `tests/quic_packet_header.cc` 还验证拼接的 Handshake 包、0-RTT 包、带 Token 的 Initial、1-RTT 短包头，以及损坏的连接 ID、Token、Length、版本和固定位。构造函数不会分配包号、不会加密或认证，也不会生成 Retry 完整性标签；本模块的“布局正确”不能当作真实网络包已经有效。
+
+### RFC 9000 §17.2.1：版本协商包
+
+客户端发出服务器不支持的版本时，服务器可以回复 Version Negotiation（VN）包。它的版本字段固定为四字节零，后面依次是目的连接 ID 长度与内容、源连接 ID 长度与内容、每项四字节的支持版本列表。它**没有**包号和 Length，因此占满一个 UDP 数据报；不能拿普通长包头解析器去找下一个拼接包。首字节最高位为 1，其余七位是任意值；其中平时称作 Fixed Bit 的 `0x40` 位，在 VN 中也只是 unused，接收方要忽略。[RFC 9000 §17.2.1](https://www.rfc-editor.org/rfc/rfc9000.html#section-17.2.1)
+
+`build_version_negotiation(dcid, scid, versions)` 默认把 unused 的 `0x40` 位置 1，符合规范对与其他协议复用时的建议；调用者也能指定完整的七位 unused 值。`parse_version_negotiation(datagram)` 则接受该位为 0 或 1，检查版本为零、两个连接 ID 的长度不越界，以及末尾有完整的四字节版本项。它返回字段内容，不改变连接状态。假设收到的请求包是 `SCID=xy, DCID=z`，服务器回复时应使用 `DCID=xy, SCID=z`；代码中的构造函数按**回复**字段收参数，连接层将来必须负责交换原请求的 ID。
+
+一个容易踩的坑：普通 v1 长包头的连接 ID 最多 20 字节，VN 却不属于某个具体版本，其长度字段可表示最多 255 字节。服务器面对未来版本时不能用 v1 的 20 字节限制决定能否构造 VN；所以 VN 读写独立采用 8 位长度界限。测试用 21 字节 ID 验证这一点。解析出的版本列表并不能直接决定是否切换版本。仅支持 v1 的客户端若已成功处理其他包，或列表仍包含它最初选择的 v1，必须丢弃 VN；否则应放弃当前连接尝试。当前没有连接状态机来执行这些条件。[RFC 9000 §6.2](https://www.rfc-editor.org/rfc/rfc9000.html#section-6.2)
+
+### RFC 9000 §17.2.5：Retry 的字段和安全边界
+
+Retry 的首字节高四位为 `1111`，随后是 v1 版本号、两个有长度的连接 ID、不带长度字段的 Token、最后固定 16 字节的 Retry Integrity Tag。解析时从报文尾部倒数 16 字节划出 tag，中间剩余的都是 Token；Token 为空的包应被客户端丢弃。与受保护的 Initial 不同，Retry 没有包号、Length 或经过报头保护的字段，也占满一个数据报。[RFC 9000 §17.2.5](https://www.rfc-editor.org/rfc/rfc9000.html#section-17.2.5)
+
+`parse_retry_packet()` 只检查这些字节的布局：v1 版本、CID 不超过 20 字节、Token 非空且尾部有 16 字节 tag。**返回非空并不表示这个 Retry 可信。**攻击者可以任意填入 16 字节 tag，让字段解析照样成功。客户端必须用自己最初发送的目标连接 ID，按照 RFC 9001 §5.8 计算并验证 Retry Integrity Tag；验证失败必须丢弃。在此之前，不得把 Token、服务器连接 ID 或其他字段写入连接状态。当前尚未实现这个加密验证，也没有生成合法 Retry tag 的构造函数。[RFC 9001 §5.8](https://www.rfc-editor.org/rfc/rfc9001.html#section-5.8)
+
+可以自己检验是否理解：为何 VN 能容纳 21 字节连接 ID，而 Retry 不能？因为 VN 的格式与版本无关，而这个 Retry 明确带有 v1 版本字段。为何把 Retry 尾部 16 字节切下来还不算验证？因为字节数正确不证明 tag 是用规范密钥、Nonce 和原始目标连接 ID 算出来的。
 
 ## RFC 9000 §19：基础帧编解码
 
@@ -277,7 +293,7 @@ PTO（Probe Timeout）是“等待确认过久时，什么时候尝试发探测�
 
 | 规范范围 | 已有的可调用代码 | 必须继续实现的内容 |
 | --- | --- | --- |
-| RFC 9000 | 变长整数、包号数值编解码、部分 v1 受保护包头、`0x00`–`0x1e` 核心帧线上格式 | Version Negotiation、Retry、扩展帧、三类包号空间、帧合法性、流与流量控制、连接与迁移状态、UDP 数据报组装 |
+| RFC 9000 | 变长整数、包号数值编解码、部分 v1 受保护包头、VN 构造与解析、Retry 字段解析、`0x00`–`0x1e` 核心帧线上格式 | VN 接受逻辑、Retry 完整性验证及发送、扩展帧、三类包号空间、帧合法性、流与流量控制、连接与迁移状态、UDP 数据报组装 |
 | RFC 9001 | 已给定 mask 时的报头异或与样本位置 | TLS 1.3 集成、Initial/Handshake/1-RTT 密钥、mask 生成、AEAD 加解密与认证、密钥更新和丢弃 |
 | RFC 9002 | RTT 估计、PTO 基础时长 | ACK 处理、发包记录、丢包判断、PTO 定时器与退避、拥塞控制及 ECN 验证 |
 
@@ -291,7 +307,7 @@ PTO（Probe Timeout）是“等待确认过久时，什么时候尝试发探测�
 | --- | --- | --- |
 | `varint` | RFC 9000 §16、附录 A.1；长度边界、非最短编码与截断 | 现有实现和测试中的行为与对照规则一致 |
 | `packet_number` | RFC 9000 §17.1、附录 A.2/A.3；半窗口、回绕与 62 位上限 | 现有数值接口与对照规则一致；包号空间管理尚不存在 |
-| `packet_header` | RFC 9000 §17.2–17.3、RFC 9001 §5.4；v1 包型、CID、Length、样本可用性 | 已实现包型的受保护布局检查与构造符合对照规则；Version Negotiation、Retry 等未实现 |
+| `packet_header` | RFC 9000 §17.2–17.3、RFC 9001 §5.4；v1 包型、CID、Length、样本可用性 | 已实现受保护包头布局、VN 线上格式和 Retry 字段解析；客户端接受规则与 Retry tag 验证尚未实现 |
 | `frame` | RFC 9000 §12.4、§19.1–19.20；长度、ACK gap、流终点、控制帧长度和本地数值界限 | 核心帧的线上字段已编码和解析；帧上下文、扩展帧与连接语义未实现 |
 | `header_protection` | RFC 9001 §5.4；样本位置、首字节掩码宽度、收发操作顺序 | 已给定 mask 时的基础操作与对照规则一致；样本生成和完整包认证未实现 |
 | `rtt_estimator` | RFC 9002 §5.3、§6.2.1 与勘误 7539；ACK Delay、更新顺序、PTO | 修正一处变动值更新顺序；ACK 处理与定时器未实现 |
