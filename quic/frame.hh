@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -69,6 +70,38 @@ struct StreamsBlockedFrame
   bool unidirectional;
   uint64_t maximum_streams;
 };
+struct NewTokenFrame
+{
+  std::string token;
+};
+struct PathChallengeFrame
+{
+  std::array<uint8_t, 8> data;
+};
+struct PathResponseFrame
+{
+  std::array<uint8_t, 8> data;
+};
+struct HandshakeDoneFrame
+{};
+struct NewConnectionIdFrame
+{
+  uint64_t sequence;
+  uint64_t retire_prior_to;
+  std::string cid;
+  std::array<uint8_t, 16> reset_token;
+};
+struct RetireConnectionIdFrame
+{
+  uint64_t sequence;
+};
+struct ConnectionCloseFrame
+{
+  bool application;
+  uint64_t error_code;
+  std::optional<uint64_t> frame_type;
+  std::string reason;
+};
 struct AckRange
 {
   uint64_t smallest;
@@ -99,7 +132,14 @@ using Frame = std::variant<PaddingFrame,
                            MaxStreamsFrame,
                            DataBlockedFrame,
                            StreamDataBlockedFrame,
-                           StreamsBlockedFrame>;
+                           StreamsBlockedFrame,
+                           NewTokenFrame,
+                           PathChallengeFrame,
+                           PathResponseFrame,
+                           HandshakeDoneFrame,
+                           NewConnectionIdFrame,
+                           RetireConnectionIdFrame,
+                           ConnectionCloseFrame>;
 
 std::optional<std::vector<Frame>> decode_frames( std::string_view payload );
 std::string encode_frame( const Frame& frame );

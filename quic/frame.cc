@@ -24,6 +24,20 @@ std::optional<std::string> read_data( const std::string_view payload, size_t& cu
   cursor += static_cast<size_t>( length );
   return result;
 }
+
+template<size_t N>
+std::optional<std::array<uint8_t, N>> read_fixed( const std::string_view payload, size_t& cursor )
+{
+  if ( payload.size() - cursor < N ) {
+    return std::nullopt;
+  }
+  std::array<uint8_t, N> result {};
+  for ( size_t i = 0; i < N; ++i ) {
+    result[i] = static_cast<uint8_t>( payload[cursor + i] );
+  }
+  cursor += N;
+  return result;
+}
 } // namespace
 
 std::optional<std::vector<Frame>> decode_frames( const std::string_view payload )
@@ -102,6 +116,16 @@ std::optional<std::vector<Frame>> decode_frames( const std::string_view payload 
         return std::nullopt;
       }
       frames.emplace_back( CryptoFrame { *offset, std::move( *data ) } );
+    } else if ( type == 7 ) {
+      const auto length = decode_varint( payload, cursor );
+      if ( !length || *length == 0 ) {
+        return std::nullopt;
+      }
+      auto token = read_data( payload, cursor, *length );
+      if ( !token ) {
+        return std::nullopt;
+      }
+      frames.emplace_back( NewTokenFrame { std::move( *token ) } );
     } else if ( type >= 8 && type <= 15 ) {
       const auto stream_id = decode_varint( payload, cursor );
       if ( !stream_id ) {
@@ -155,6 +179,64 @@ std::optional<std::vector<Frame>> decode_frames( const std::string_view payload 
       } else {
         frames.emplace_back( StreamsBlockedFrame { bool( type & 1 ), *maximum_streams } );
       }
+    } else if ( type == 0x18 ) {
+      const auto sequence = decode_varint( payload, cursor );
+      const auto retire_prior_to = decode_varint( payload, cursor );
+      if ( !sequence || !retire_prior_to || *retire_prior_to > *sequence || cursor >= payload.size() ) {
+        return std::nullopt;
+      }
+      const uint8_t cid_length = static_cast<uint8_t>( payload[cursor++] );
+      if ( cid_length == 0 || cid_length > 20 ) {
+        return std::nullopt;
+      }
+      auto cid = read_data( payload, cursor, cid_length );
+      if ( !cid ) {
+        return std::nullopt;
+      }
+      const auto reset_token = read_fixed<16>( payload, cursor );
+      if ( !reset_token ) {
+        return std::nullopt;
+      }
+      frames.emplace_back( NewConnectionIdFrame { *sequence, *retire_prior_to, std::move( *cid ), *reset_token } );
+    } else if ( type == 0x19 ) {
+      const auto sequence = decode_varint( payload, cursor );
+      if ( !sequence ) {
+        return std::nullopt;
+      }
+      frames.emplace_back( RetireConnectionIdFrame { *sequence } );
+    } else if ( type == 0x1a || type == 0x1b ) {
+      const auto data = read_fixed<8>( payload, cursor );
+      if ( !data ) {
+        return std::nullopt;
+      }
+      if ( type == 0x1a ) {
+        frames.emplace_back( PathChallengeFrame { *data } );
+      } else {
+        frames.emplace_back( PathResponseFrame { *data } );
+      }
+    } else if ( type == 0x1c || type == 0x1d ) {
+      const auto error_code = decode_varint( payload, cursor );
+      if ( !error_code ) {
+        return std::nullopt;
+      }
+      std::optional<uint64_t> frame_type;
+      if ( type == 0x1c ) {
+        frame_type = decode_varint( payload, cursor );
+        if ( !frame_type ) {
+          return std::nullopt;
+        }
+      }
+      const auto reason_length = decode_varint( payload, cursor );
+      if ( !reason_length ) {
+        return std::nullopt;
+      }
+      auto reason = read_data( payload, cursor, *reason_length );
+      if ( !reason ) {
+        return std::nullopt;
+      }
+      frames.emplace_back( ConnectionCloseFrame { type == 0x1d, *error_code, frame_type, std::move( *reason ) } );
+    } else if ( type == 0x1e ) {
+      frames.emplace_back( HandshakeDoneFrame {} );
     } else {
       return std::nullopt;
     }
@@ -220,6 +302,38 @@ std::string encode_frame( const Frame& frame )
           throw std::out_of_range( "STREAMS_BLOCKED exceeds 2^60" );
         }
         return std::string( 1, value.unidirectional ? '\x17' : '\x16' ) + encode_varint( value.maximum_streams );
+      } else if constexpr ( std::is_same_v<T, NewTokenFrame> ) {
+        if ( value.token.empty() ) {
+          throw std::invalid_argument( "NEW_TOKEN token must be nonempty" );
+        }
+        return std::string( 1, '\x07' ) + encode_varint( value.token.size() ) + value.token;
+      } else if constexpr ( std::is_same_v<T, PathChallengeFrame> ) {
+        return std::string( 1, '\x1a' ) + std::string( value.data.begin(), value.data.end() );
+      } else if constexpr ( std::is_same_v<T, PathResponseFrame> ) {
+        return std::string( 1, '\x1b' ) + std::string( value.data.begin(), value.data.end() );
+      } else if constexpr ( std::is_same_v<T, HandshakeDoneFrame> ) {
+        return std::string( 1, '\x1e' );
+      } else if constexpr ( std::is_same_v<T, NewConnectionIdFrame> ) {
+        if ( value.cid.empty() || value.cid.size() > 20 || value.retire_prior_to > value.sequence ) {
+          throw std::invalid_argument( "invalid NEW_CONNECTION_ID fields" );
+        }
+        return std::string( 1, '\x18' ) + encode_varint( value.sequence ) + encode_varint( value.retire_prior_to )
+               + static_cast<char>( value.cid.size() ) + value.cid
+               + std::string( value.reset_token.begin(), value.reset_token.end() );
+      } else if constexpr ( std::is_same_v<T, RetireConnectionIdFrame> ) {
+        return std::string( 1, '\x19' ) + encode_varint( value.sequence );
+      } else if constexpr ( std::is_same_v<T, ConnectionCloseFrame> ) {
+        if ( value.application == value.frame_type.has_value() ) {
+          throw std::invalid_argument( "CONNECTION_CLOSE frame type must match variant" );
+        }
+        std::string result( 1, value.application ? '\x1d' : '\x1c' );
+        result += encode_varint( value.error_code );
+        if ( value.frame_type ) {
+          result += encode_varint( *value.frame_type );
+        }
+        result += encode_varint( value.reason.size() );
+        result += value.reason;
+        return result;
       } else {
         if ( value.ranges.empty() || value.ranges.front().largest > max_varint ) {
           throw std::invalid_argument( "ACK needs a valid first range" );

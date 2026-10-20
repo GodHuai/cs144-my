@@ -1,6 +1,6 @@
 # QUIC v1 实现讲解（进行中）
 
-当前完成 RFC 9000 §16 的变长整数、§17.1 的包号编解码、§17.2–17.3 的部分受保护包头布局、§19 的部分帧编解码（包括流停止、额度与阻塞帧）、RFC 9001 §5.4 的报头掩码基础操作，以及 RFC 9002 §5 的 RTT 估计和 §6.2.1 的 PTO 时长计算。它们还没有组成 QUIC 连接；TLS、AEAD、版本协商与 Retry、其余帧、ACK 与丢包状态机、UDP 互通仍未完成。最终以完整协议代码、测试和 `coverage.md` 为准。
+当前完成 RFC 9000 §16 的变长整数、§17.1 的包号编解码、§17.2–17.3 的部分受保护包头布局、§19.1–19.20 的**核心帧线上格式**编解码、RFC 9001 §5.4 的报头掩码基础操作，以及 RFC 9002 §5 的 RTT 估计和 §6.2.1 的 PTO 时长计算。它们还没有组成 QUIC 连接；TLS、AEAD、版本协商与 Retry、ACK 与丢包状态机、UDP 互通仍未完成。扩展帧及逐帧语义也尚未处理。最终以完整协议代码、测试和 `coverage.md` 为准。
 
 这份笔记按初学者能逐步手算的顺序编写：每节先说 RFC 规定什么，再解释为什么，最后回到当前 C++ 源码。笔记中的代码片段只摘取决定行为的语句；完整可编译代码以相应 `quic/*.hh`、`quic/*.cc` 和 `tests/quic_*.cc` 为准，避免复制一份会随实现变化而失真的源码。
 
@@ -142,7 +142,7 @@ layout.packet_end = cursor + static_cast<size_t>( *length );
 
 QUIC 包通过帧传递控制信息和数据。可以把一个包的明文载荷想成若干张接在一起的“小纸条”：每张先写帧类型，再写该类型约定的字段。接收方必须知道一张纸条在哪里结束，才能找到下一张。`quic/frame.hh/.cc` 的 `decode_frames()` 接收**已经完成 AEAD 认证**的整段载荷，依次解码并返回 `Frame` 列表；空载荷或任何一处格式错误都返回空值，不把已经读出的前缀交给连接层。`encode_frame()` 把单个结构化帧还原成线上字节。[RFC 9000 §12.4](https://www.rfc-editor.org/rfc/rfc9000.html#section-12.4)
 
-当前支持 PADDING、PING、ACK/ACK_ECN、RESET_STREAM、STOP_SENDING、CRYPTO、STREAM，以及 `0x10`–`0x17` 的额度与阻塞帧。除类型外，各整数均调用已有的 QUIC 变长整数编解码器。帧类型必须用最短长度，本轮支持的类型都只占一字节；未知类型和非最短类型会使整段解析失败。[RFC 9000 §19](https://www.rfc-editor.org/rfc/rfc9000.html#section-19)
+当前覆盖 RFC 9000 定义的全部**核心帧类型** `0x00`–`0x1e`：数据帧、ACK、流控制、令牌、连接 ID、路径、关闭和握手完成。除类型外，各整数均调用已有的 QUIC 变长整数编解码器。帧类型必须用最短长度，这些核心类型都只占一字节；未知类型和非最短类型会使整段解析失败。**支持线上格式不等于支持扩展帧，也不等于能作为连接处理这些帧。**[RFC 9000 §19](https://www.rfc-editor.org/rfc/rfc9000.html#section-19)
 
 | 帧 | 类型字节 | 主要字段 | 当前代码的表示 |
 | --- | --- | --- | --- |
@@ -152,11 +152,16 @@ QUIC 包通过帧传递控制信息和数据。可以把一个包的明文载荷
 | RESET_STREAM | `04` | 流 ID、应用错误码、最终大小 | `ResetStreamFrame` |
 | STOP_SENDING | `05` | 流 ID、应用错误码 | `StopSendingFrame` |
 | CRYPTO | `06` | 偏移、长度、TLS 握手字节 | `CryptoFrame{offset, data}` |
+| NEW_TOKEN | `07` | 长度与非空令牌 | `NewTokenFrame` |
 | STREAM | `08`–`0f` | 流 ID、可选偏移/长度、FIN、字节 | `StreamFrame` |
 | MAX_DATA / MAX_STREAM_DATA | `10` / `11` | 连接额度；或流 ID 与该流额度 | `MaxDataFrame` / `MaxStreamDataFrame` |
 | MAX_STREAMS | `12` / `13` | 双向或单向流的累计可开数量 | `MaxStreamsFrame` |
 | DATA_BLOCKED / STREAM_DATA_BLOCKED | `14` / `15` | 被阻塞时的连接额度；或流 ID 与额度 | `DataBlockedFrame` / `StreamDataBlockedFrame` |
 | STREAMS_BLOCKED | `16` / `17` | 双向或单向流的阻塞数量上限 | `StreamsBlockedFrame` |
+| NEW_CONNECTION_ID / RETIRE_CONNECTION_ID | `18` / `19` | 序号、退休阈值、CID、16 字节重置令牌；或被退休的序号 | `NewConnectionIdFrame` / `RetireConnectionIdFrame` |
+| PATH_CHALLENGE / PATH_RESPONSE | `1a` / `1b` | 各 8 字节不透明数据 | `PathChallengeFrame` / `PathResponseFrame` |
+| CONNECTION_CLOSE | `1c` / `1d` | 错误码、可选触发帧类型、原因长度与原因 | `ConnectionCloseFrame` |
+| HANDSHAKE_DONE | `1e` | 无 | `HandshakeDoneFrame` |
 
 `Frame` 是以上结构体的 `std::variant`。`decode_frames()` 只解析格式；例如它能解析出一个 STREAM 帧，却不知道这个流是否允许对端发送、是否超出流量控制额度。只有将来连接层结合包类型和流状态才能决定是否接受。尤其 Initial/Handshake、0-RTT、1-RTT 允许的帧集合不同，当前解析器尚未检查。[RFC 9000 §12.5](https://www.rfc-editor.org/rfc/rfc9000.html#section-12.5)
 
@@ -197,6 +202,18 @@ ack.ranges.push_back( AckRange { range_largest - *length, range_largest } );
 `MAX_STREAMS` 的 `12` / `13` 与 `STREAMS_BLOCKED` 的 `16` / `17` 用**类型字节**区分双向和单向；后面的整数都是可开流的累计数量，不是已经开了多少条。流 ID 只有 62 位，其中最低两位是发起方和方向，因此数量上限是 `2^60`，超过它的 `MAX_STREAMS` 或 `STREAMS_BLOCKED` 会被解码器拒绝。[RFC 9000 §19.11](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.11)、[§19.14](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.14)
 
 源码中两字段帧先连续调用两次 `decode_varint()`，三字段的 RESET_STREAM 调用三次；任一字段截断则 `decode_frames()` 丢弃整段帧列表。`0x12`、`0x13`、`0x16`、`0x17` 共用一次 `maximum_streams <= 2^60` 检查，随后以类型最低位填充 `unidirectional`。测试把八种额度/阻塞帧顺序拼在同一载荷中，检查每个字段并比对重新编码后的字节；这样能抓到“多吃了下一个帧的字节”的错误。还检查了流数量零、`2^60` 上限、`2^60+1` 拒绝和已有 PING 后截断时不返回部分结果。
+
+### 令牌、连接 ID、路径与关闭帧：读定长和变长字段
+
+`NEW_TOKEN` 的 `07 02 ab cd` 表示类型 `07`、长度 2、两字节不透明令牌 `ab cd`。这里的“令牌”是未来连接的地址验证材料，不是应用数据；规范要求非空，所以 `07 00` 必须拒绝。服务器何时发令牌、客户端如何保存和以后使用，属于尚未实现的连接层。[RFC 9000 §19.7](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.7)
+
+`NEW_CONNECTION_ID` 按“序号 → Retire Prior To → 一字节 CID 长度 → CID → **固定 16 字节** Stateless Reset Token”解析。`CID` 长度只允许 1–20；`Retire Prior To` 不能大于该帧序号。测试用序号 5、退休阈值 3、CID `ab` 和十六个 `00`–`0f` 字节逐项检查。`RETIRE_CONNECTION_ID` 则只带一个序号。例如 `19 05` 表示退休序号 5。重复序号、已发 CID 清单、重置令牌存储与迁移时使用哪一个 CID 都需要连接状态，解析器尚不能判断。[RFC 9000 §19.15](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.15)、[§19.16](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.16)
+
+`PATH_CHALLENGE` (`1a`) 与 `PATH_RESPONSE` (`1b`) 各带**恰好八字节**不透明数据。解析器只读出这八字节；未来收到挑战时，连接层要用同样的数据回复，并结合发送路径判断验证是否成功。`HANDSHAKE_DONE` (`1e`) 没有字段，只有服务端在完成握手后可发送；仅解析出它并不意味着可以提前确认握手。[RFC 9000 §19.17–19.20](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.17)
+
+`CONNECTION_CLOSE` 有两种**不同布局**：传输错误 `1c` 是“错误码、触发它的帧类型、原因长度、原因字节”；应用错误 `1d` 删去“触发帧类型”。例如 `1c 0a 08 03 62 61 64` 表示传输错误码 10、触发帧类型 8、三字节原因 `bad`。`1d 25 00` 表示应用错误码 37、空原因。源码用 `frame_type` 是否存在与 `application` 标志相互校验，防止编码出错位的字段；解码时以线上类型决定是否读取该字段。原因长度按**字节数**计算，可以为零，规范建议原因文本使用 UTF-8，但本层只保留字节，尚未实现文字验证或关闭状态机。[RFC 9000 §19.19](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.19)
+
+解析器对 CID、路径数据和重置令牌使用“先确认剩余长度，再读取固定字节数”的做法；对令牌与原因使用显式长度与 `read_data()`。如果完整明文载荷中任何一帧截断，就返回 `std::nullopt`，避免把前面已读出的帧误交给连接层。测试包含合法相邻帧、空令牌、CID 长度 0 或 21、退休阈值倒置、重置令牌缺字节、路径数据缺字节，以及两种关闭帧原因截断。
 
 CRYPTO 和 STREAM 的“偏移 + 数据长度”不能超过 `2^62−1`。代码先比较剩余字节和长度，再复制数据；ACK Range Count 先受载荷剩余长度约束，以免畸形计数导致无意义的长循环。`tests/quic_frames.cc` 检查组合帧往返、无 LEN 的 STREAM、空 FIN、ACK/ACK_ECN、新增控制帧、空载荷、截断、未知类型、区间下溢、畸形大计数与数值边界。帧所在的包类型、流方向与流量控制、CRYPTO 加密级别等语义规则仍需连接层实现，不能把“能解析”理解为“可以接受”。
 
@@ -260,7 +277,7 @@ PTO（Probe Timeout）是“等待确认过久时，什么时候尝试发探测�
 
 | 规范范围 | 已有的可调用代码 | 必须继续实现的内容 |
 | --- | --- | --- |
-| RFC 9000 | 变长整数、包号数值编解码、部分 v1 受保护包头、五类基础帧格式 | Version Negotiation、Retry、其余帧、三类包号空间、流与流量控制、连接与迁移状态、UDP 数据报组装 |
+| RFC 9000 | 变长整数、包号数值编解码、部分 v1 受保护包头、`0x00`–`0x1e` 核心帧线上格式 | Version Negotiation、Retry、扩展帧、三类包号空间、帧合法性、流与流量控制、连接与迁移状态、UDP 数据报组装 |
 | RFC 9001 | 已给定 mask 时的报头异或与样本位置 | TLS 1.3 集成、Initial/Handshake/1-RTT 密钥、mask 生成、AEAD 加解密与认证、密钥更新和丢弃 |
 | RFC 9002 | RTT 估计、PTO 基础时长 | ACK 处理、发包记录、丢包判断、PTO 定时器与退避、拥塞控制及 ECN 验证 |
 
@@ -275,7 +292,7 @@ PTO（Probe Timeout）是“等待确认过久时，什么时候尝试发探测�
 | `varint` | RFC 9000 §16、附录 A.1；长度边界、非最短编码与截断 | 现有实现和测试中的行为与对照规则一致 |
 | `packet_number` | RFC 9000 §17.1、附录 A.2/A.3；半窗口、回绕与 62 位上限 | 现有数值接口与对照规则一致；包号空间管理尚不存在 |
 | `packet_header` | RFC 9000 §17.2–17.3、RFC 9001 §5.4；v1 包型、CID、Length、样本可用性 | 已实现包型的受保护布局检查与构造符合对照规则；Version Negotiation、Retry 等未实现 |
-| `frame` | RFC 9000 §12.4、§19.1–19.3、§19.6、§19.8；长度、ACK gap、流终点 | 已实现的五类帧格式与对照规则一致；帧上下文和其余帧未实现 |
+| `frame` | RFC 9000 §12.4、§19.1–19.20；长度、ACK gap、流终点、控制帧长度和本地数值界限 | 核心帧的线上字段已编码和解析；帧上下文、扩展帧与连接语义未实现 |
 | `header_protection` | RFC 9001 §5.4；样本位置、首字节掩码宽度、收发操作顺序 | 已给定 mask 时的基础操作与对照规则一致；样本生成和完整包认证未实现 |
 | `rtt_estimator` | RFC 9002 §5.3、§6.2.1 与勘误 7539；ACK Delay、更新顺序、PTO | 修正一处变动值更新顺序；ACK 处理与定时器未实现 |
 
@@ -290,7 +307,7 @@ ctest --test-dir build -R '^quic_' --output-on-failure
 ctest --test-dir build --output-on-failure -j2
 ```
 
-新增控制帧并格式化后，QUIC 定向测试（含公共编译夹具）为 **5/5 通过**。同一源码下、无额外 12 秒超时限制的全量 CTest **43 项中 41 项通过**；`net_interface` 与 `router` 因缺少相应的测试可执行文件而未运行，因此全量测试命令退出状态为 8。这组数字是运行记录，不会随着文档编辑自动更新。
+补全核心帧并格式化后，QUIC 定向测试（含公共编译夹具）为 **5/5 通过**。同一源码下、无额外 12 秒超时限制的全量 CTest **43 项中 41 项通过**；`net_interface` 与 `router` 因缺少相应的测试可执行文件而未运行，因此全量测试命令退出状态为 8。这组数字是运行记录，不会随着文档编辑自动更新。
 
 代码实现时使用测试先行：先看见缺少接口、缺少 ACK 支持或空载荷缺陷使测试失败，再补实现。独立审查发现的 ACK 取样条件、ACK Delay 上限测试、62 位边界与短包头样本长度问题已修正。本次复核又发现 RTT 变动值与 RFC 9002 勘误的顺序不符：先将断言改为 40 ms，观察到 `quic_packet_primitives` 因得到旧结果 39.6875 ms 而失败；再调整实现顺序，定向测试恢复通过。各里程碑的任务与具体测试范围记录在 `docs/superpowers/plans/2026-10-19-quic-packet-primitives.md`、`2026-10-19-quic-basic-frames.md` 和 `2026-10-19-quic-packet-header.md`。
 

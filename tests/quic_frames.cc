@@ -1,5 +1,6 @@
 #include "quic/frame.hh"
 
+#include <array>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -146,4 +147,103 @@ int main()
     rejected_limit = true;
   }
   require( rejected_limit, "oversize MAX_STREAMS encoded" );
+
+  // RFC 9000 §§19.7, 19.17-19.18, 19.20: byte strings, two fixed 8-byte blobs, and an empty frame.
+  const std::string token_wire { "\x07\x02\xab\xcd", 4 };
+  const auto token_frames = decode_frames( token_wire );
+  require( token_frames && token_frames->size() == 1, "NEW_TOKEN decoded" );
+  require( std::get<NewTokenFrame>( token_frames->front() ).token == std::string( "\xab\xcd", 2 ),
+           "NEW_TOKEN bytes" );
+  require( encode_frame( token_frames->front() ) == token_wire, "NEW_TOKEN wire bytes" );
+
+  const std::string path_wire { "\x1a\x01\x02\x03\x04\x05\x06\x07\x08"
+                                "\x1b\x08\x07\x06\x05\x04\x03\x02\x01\x1e",
+                                19 };
+  const auto path_frames = decode_frames( path_wire );
+  require( path_frames && path_frames->size() == 3, "PATH and HANDSHAKE_DONE sequence" );
+  require( std::get<PathChallengeFrame>( ( *path_frames )[0] ).data
+             == ( std::array<uint8_t, 8> { 1, 2, 3, 4, 5, 6, 7, 8 } ),
+           "PATH_CHALLENGE data" );
+  require( std::get<PathResponseFrame>( ( *path_frames )[1] ).data
+             == ( std::array<uint8_t, 8> { 8, 7, 6, 5, 4, 3, 2, 1 } ),
+           "PATH_RESPONSE data" );
+  require( std::holds_alternative<HandshakeDoneFrame>( ( *path_frames )[2] ), "HANDSHAKE_DONE type" );
+  std::string path_encoded;
+  for ( const auto& frame : *path_frames ) {
+    path_encoded += encode_frame( frame );
+  }
+  require( path_encoded == path_wire, "PATH and HANDSHAKE_DONE wire bytes" );
+  require( !decode_frames( std::string( "\x07\x00", 2 ) ), "empty NEW_TOKEN accepted" );
+  require( !decode_frames( std::string( "\x01\x07\x02\xab", 4 ) ), "truncated NEW_TOKEN kept PING prefix" );
+  require( !decode_frames( std::string( "\x1a\x01\x02\x03\x04\x05\x06\x07", 8 ) ),
+           "truncated PATH_CHALLENGE accepted" );
+  require( !decode_frames( std::string( "\x1b\x01\x02\x03\x04\x05\x06\x07", 8 ) ),
+           "truncated PATH_RESPONSE accepted" );
+
+  // RFC 9000 §§19.15-19.16: sequence=5, retire_prior_to=3, two CID bytes, 16 reset-token bytes.
+  const std::string cid_wire = std::string( "\x18\x05\x03\x02"
+                                            "ab",
+                                            6 )
+                               + std::string( "\x00\x01\x02\x03\x04\x05\x06\x07"
+                                              "\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f",
+                                              16 );
+  const auto cid_frames = decode_frames( cid_wire + std::string( "\x19\x05", 2 ) );
+  require( cid_frames && cid_frames->size() == 2, "NEW/RETIRE_CONNECTION_ID sequence" );
+  const auto& new_cid = std::get<NewConnectionIdFrame>( ( *cid_frames )[0] );
+  require( new_cid.sequence == 5 && new_cid.retire_prior_to == 3 && new_cid.cid == "ab",
+           "NEW_CONNECTION_ID fields" );
+  require( new_cid.reset_token
+             == ( std::array<uint8_t, 16> { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 } ),
+           "NEW_CONNECTION_ID reset token" );
+  require( std::get<RetireConnectionIdFrame>( ( *cid_frames )[1] ).sequence == 5, "RETIRE_CONNECTION_ID sequence" );
+  require( encode_frame( ( *cid_frames )[0] ) == cid_wire, "NEW_CONNECTION_ID wire bytes" );
+  require( encode_frame( ( *cid_frames )[1] ) == std::string( "\x19\x05", 2 ), "RETIRE_CONNECTION_ID wire bytes" );
+  require( !decode_frames( std::string( "\x18\x01\x02\x01x", 5 ) + std::string( 16, '\0' ) ),
+           "retire_prior_to above sequence accepted" );
+  require( !decode_frames( std::string( "\x18\x01\x00\x00", 4 ) ), "zero-length CID accepted" );
+  require( !decode_frames( std::string( "\x18\x01\x00\x15", 4 ) ), "21-byte CID accepted" );
+  require( !decode_frames( cid_wire.substr( 0, cid_wire.size() - 1 ) ), "truncated reset token accepted" );
+  require( !decode_frames( std::string( "\x19", 1 ) ), "truncated RETIRE_CONNECTION_ID accepted" );
+
+  bool rejected_cid = false;
+  try {
+    encode_frame( NewConnectionIdFrame { 1, 2, "x", {} } );
+  } catch ( const std::invalid_argument& ) {
+    rejected_cid = true;
+  }
+  require( rejected_cid, "invalid NEW_CONNECTION_ID encoded" );
+
+  // RFC 9000 §19.19: transport close includes Frame Type; application close omits it.
+  const std::string close_wire { "\x1c\x0a\x08\x03"
+                                 "bad"
+                                 "\x1d\x25\x00\x1e",
+                                 11 };
+  const auto close_frames = decode_frames( close_wire );
+  require( close_frames && close_frames->size() == 3, "both CONNECTION_CLOSE variants and next frame" );
+  const auto& transport_close = std::get<ConnectionCloseFrame>( ( *close_frames )[0] );
+  require( !transport_close.application && transport_close.error_code == 10 && transport_close.frame_type == 8
+             && transport_close.reason == "bad",
+           "transport CONNECTION_CLOSE fields" );
+  const auto& application_close = std::get<ConnectionCloseFrame>( ( *close_frames )[1] );
+  require( application_close.application && application_close.error_code == 37 && !application_close.frame_type
+             && application_close.reason.empty(),
+           "application CONNECTION_CLOSE fields" );
+  require( std::holds_alternative<HandshakeDoneFrame>( ( *close_frames )[2] ), "frame after close" );
+  std::string close_encoded;
+  for ( const auto& frame : *close_frames ) {
+    close_encoded += encode_frame( frame );
+  }
+  require( close_encoded == close_wire, "CONNECTION_CLOSE wire bytes" );
+  require( !decode_frames( std::string( "\x1c\x0a\x08\x03"
+                                        "ba",
+                                        6 ) ),
+           "truncated transport close reason accepted" );
+  require( !decode_frames( std::string( "\x1d\x0a\x02x", 4 ) ), "truncated application close reason accepted" );
+  bool rejected_close = false;
+  try {
+    encode_frame( ConnectionCloseFrame { false, 10, std::nullopt, "" } );
+  } catch ( const std::invalid_argument& ) {
+    rejected_close = true;
+  }
+  require( rejected_close, "transport close without frame type encoded" );
 }

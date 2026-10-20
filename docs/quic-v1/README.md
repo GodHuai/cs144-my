@@ -17,7 +17,7 @@
 | 一个整数如何占 1、2、4、8 字节？ | RFC 9000 §16 | [varint.hh](../../quic/varint.hh)、[varint.cc](../../quic/varint.cc) | [quic_varint.cc](../../tests/quic_varint.cc) |
 | 为什么只发包号的低 1–4 字节还能恢复完整包号？ | RFC 9000 §17.1 | [packet_number.hh](../../quic/packet_number.hh)、[packet_number.cc](../../quic/packet_number.cc) | [quic_packet_primitives.cc](../../tests/quic_packet_primitives.cc) |
 | 拼接的包如何定位边界与包号字段？ | RFC 9000 §17.2–17.3 | [packet_header.hh](../../quic/packet_header.hh)、[packet_header.cc](../../quic/packet_header.cc) | [quic_packet_header.cc](../../tests/quic_packet_header.cc) |
-| ACK、STREAM、流停止与流量额度等帧在载荷里是什么样子？ | RFC 9000 §19 | [frame.hh](../../quic/frame.hh)、[frame.cc](../../quic/frame.cc) | [quic_frames.cc](../../tests/quic_frames.cc) |
+| ACK、STREAM、连接 ID、路径、关闭等核心帧在载荷里是什么样子？ | RFC 9000 §19 | [frame.hh](../../quic/frame.hh)、[frame.cc](../../quic/frame.cc) | [quic_frames.cc](../../tests/quic_frames.cc) |
 | 报头保护为什么先取样、再恢复包号长度？ | RFC 9001 §5.4 | [header_protection.hh](../../quic/header_protection.hh)、[header_protection.cc](../../quic/header_protection.cc) | [quic_packet_primitives.cc](../../tests/quic_packet_primitives.cc) |
 | 收到 ACK 后如何更新 RTT 和 PTO？ | RFC 9002 §5–6 | [rtt_estimator.hh](../../quic/rtt_estimator.hh)、[rtt_estimator.cc](../../quic/rtt_estimator.cc) | [quic_packet_primitives.cc](../../tests/quic_packet_primitives.cc) |
 
