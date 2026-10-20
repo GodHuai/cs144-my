@@ -55,6 +55,7 @@ ttest(send_close)
 ttest(send_extra)
 ttest(quic_varint)
 ttest(quic_packet_primitives)
+ttest(quic_frames)
 
 ttest(net_interface)
 
