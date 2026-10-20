@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 #include <variant>
+#include <vector>
 
 using namespace quic;
 
@@ -246,4 +247,51 @@ int main()
     rejected_close = true;
   }
   require( rejected_close, "transport close without frame type encoded" );
+
+  // RFC 9000 Table 3: bit 0 Initial, bit 1 Handshake, bit 2 0-RTT, bit 3 1-RTT.
+  struct PlacementCase
+  {
+    Frame frame;
+    uint8_t permitted;
+  };
+  const std::vector<PlacementCase> placements {
+    { PaddingFrame { 1 }, 0x0f },
+    { PingFrame {}, 0x0f },
+    { CryptoFrame { 0, "x" }, 0x0b },
+    { StreamFrame { 0, 0, "x", false, false, true }, 0x0c },
+    { AckFrame { 0, { AckRange { 0, 0 } }, std::nullopt }, 0x0b },
+    { ResetStreamFrame { 0, 0, 0 }, 0x0c },
+    { StopSendingFrame { 0, 0 }, 0x0c },
+    { MaxDataFrame { 1 }, 0x0c },
+    { MaxStreamDataFrame { 0, 1 }, 0x0c },
+    { MaxStreamsFrame { false, 1 }, 0x0c },
+    { DataBlockedFrame { 1 }, 0x0c },
+    { StreamDataBlockedFrame { 0, 1 }, 0x0c },
+    { StreamsBlockedFrame { false, 1 }, 0x0c },
+    { NewTokenFrame { "x" }, 0x08 },
+    { PathChallengeFrame { {} }, 0x0c },
+    { PathResponseFrame { {} }, 0x08 },
+    { HandshakeDoneFrame {}, 0x08 },
+    { NewConnectionIdFrame { 0, 0, "x", {} }, 0x0c },
+    { RetireConnectionIdFrame { 0 }, 0x08 },
+    { ConnectionCloseFrame { false, 0, std::optional<uint64_t> { 0 }, "" }, 0x0f },
+    { ConnectionCloseFrame { true, 0, std::nullopt, "" }, 0x0c },
+  };
+  const std::array<PacketKind, 4> packet_kinds {
+    PacketKind::Initial, PacketKind::Handshake, PacketKind::ZeroRtt, PacketKind::OneRtt };
+  for ( const auto& placement : placements ) {
+    for ( size_t i = 0; i < packet_kinds.size(); ++i ) {
+      require( frame_allowed_in_packet( placement.frame, packet_kinds[i] )
+                 == bool( placement.permitted & ( 1 << i ) ),
+               "RFC frame/packet placement matrix" );
+    }
+  }
+  require( !frames_allowed_in_packet( {}, PacketKind::OneRtt ), "empty frame list allowed" );
+  require( frames_allowed_in_packet( { PingFrame {}, CryptoFrame { 0, "x" } }, PacketKind::Initial ),
+           "legal mixed Initial payload" );
+  require( !frames_allowed_in_packet( { PingFrame {}, AckFrame { 0, { AckRange { 0, 0 } }, std::nullopt } },
+                                      PacketKind::ZeroRtt ),
+           "0-RTT ACK hidden after legal PING" );
+  require( !frame_allowed_in_packet( PingFrame {}, static_cast<PacketKind>( 255 ) ),
+           "invalid packet kind accepted" );
 }

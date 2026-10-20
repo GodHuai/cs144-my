@@ -1,5 +1,7 @@
 #pragma once
 
+#include "packet_header.hh"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -143,5 +145,11 @@ using Frame = std::variant<PaddingFrame,
 
 std::optional<std::vector<Frame>> decode_frames( std::string_view payload );
 std::string encode_frame( const Frame& frame );
+
+// RFC 9000 Section 12.4 Table 3. Call after authenticated packet decryption;
+// false means the combination is prohibited; the connection layer chooses
+// the RFC 9000 Section 12.5 handling for prohibited 0-RTT frames.
+bool frame_allowed_in_packet( const Frame& frame, PacketKind packet_kind );
+bool frames_allowed_in_packet( const std::vector<Frame>& frames, PacketKind packet_kind );
 
 } // namespace quic

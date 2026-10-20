@@ -367,4 +367,47 @@ std::string encode_frame( const Frame& frame )
     frame );
 }
 
+bool frame_allowed_in_packet( const Frame& frame, const PacketKind packet_kind )
+{
+  // Keep this table under review when a new frame variant is added.
+  static_assert( std::variant_size_v<Frame> == 20 );
+  if ( packet_kind != PacketKind::Initial && packet_kind != PacketKind::Handshake
+       && packet_kind != PacketKind::ZeroRtt && packet_kind != PacketKind::OneRtt ) {
+    return false;
+  }
+  if ( packet_kind == PacketKind::OneRtt ) {
+    return true;
+  }
+  if ( std::holds_alternative<PaddingFrame>( frame ) || std::holds_alternative<PingFrame>( frame ) ) {
+    return true;
+  }
+  const auto* close = std::get_if<ConnectionCloseFrame>( &frame );
+  if ( packet_kind == PacketKind::Initial || packet_kind == PacketKind::Handshake ) {
+    return std::holds_alternative<AckFrame>( frame ) || std::holds_alternative<CryptoFrame>( frame )
+           || ( close && !close->application );
+  }
+  if ( packet_kind != PacketKind::ZeroRtt ) {
+    return false;
+  }
+  // 0-RTT shares the application packet-number space, but Table 3 prohibits
+  // these six frame types in 0-RTT packets.
+  return !std::holds_alternative<AckFrame>( frame ) && !std::holds_alternative<CryptoFrame>( frame )
+         && !std::holds_alternative<NewTokenFrame>( frame ) && !std::holds_alternative<PathResponseFrame>( frame )
+         && !std::holds_alternative<RetireConnectionIdFrame>( frame )
+         && !std::holds_alternative<HandshakeDoneFrame>( frame );
+}
+
+bool frames_allowed_in_packet( const std::vector<Frame>& frames, const PacketKind packet_kind )
+{
+  if ( frames.empty() ) {
+    return false;
+  }
+  for ( const auto& frame : frames ) {
+    if ( !frame_allowed_in_packet( frame, packet_kind ) ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 } // namespace quic

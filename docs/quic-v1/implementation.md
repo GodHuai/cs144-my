@@ -179,7 +179,7 @@ QUIC 包通过帧传递控制信息和数据。可以把一个包的明文载荷
 | CONNECTION_CLOSE | `1c` / `1d` | 错误码、可选触发帧类型、原因长度与原因 | `ConnectionCloseFrame` |
 | HANDSHAKE_DONE | `1e` | 无 | `HandshakeDoneFrame` |
 
-`Frame` 是以上结构体的 `std::variant`。`decode_frames()` 只解析格式；例如它能解析出一个 STREAM 帧，却不知道这个流是否允许对端发送、是否超出流量控制额度。只有将来连接层结合包类型和流状态才能决定是否接受。尤其 Initial/Handshake、0-RTT、1-RTT 允许的帧集合不同，当前解析器尚未检查。[RFC 9000 §12.5](https://www.rfc-editor.org/rfc/rfc9000.html#section-12.5)
+`Frame` 是以上结构体的 `std::variant`。`decode_frames()` 只解析格式；例如它能解析出一个 STREAM 帧，却不知道这个流是否允许对端发送、是否超出流量控制额度。`frame_allowed_in_packet()` 和 `frames_allowed_in_packet()` 另行按包类型检查 RFC 表 3 的放置规则；它们仍不知道对端角色、流状态或 ACK 引用的包是否有效。连接层必须先完成解密认证，再调用这些纯函数，最后根据错误性质决定如何处理。[RFC 9000 §12.4](https://www.rfc-editor.org/rfc/rfc9000.html#section-12.4)、[§12.5](https://www.rfc-editor.org/rfc/rfc9000.html#section-12.5)
 
 例如 `06 02 03 61 62 63` 是一个 CRYPTO 帧：类型 `06`、偏移 2、长度 3、数据 `abc`。`0f 04 01 02 78 79` 是一个 STREAM 帧：`0f` 的 OFF/LEN/FIN 三个位全为 1，因此随后是流 ID 4、偏移 1、长度 2、数据 `xy`，且流在偏移 3 处结束。若 LEN 位为 0，数据就延伸到**当前包载荷的末尾**，因此打包器只能把这种 STREAM 放在最后；本模块的单帧编码函数无法替调用者决定排包顺序。[RFC 9000 §19.6](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.6)、[§19.8](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.8)
 
@@ -231,7 +231,22 @@ ack.ranges.push_back( AckRange { range_largest - *length, range_largest } );
 
 解析器对 CID、路径数据和重置令牌使用“先确认剩余长度，再读取固定字节数”的做法；对令牌与原因使用显式长度与 `read_data()`。如果完整明文载荷中任何一帧截断，就返回 `std::nullopt`，避免把前面已读出的帧误交给连接层。测试包含合法相邻帧、空令牌、CID 长度 0 或 21、退休阈值倒置、重置令牌缺字节、路径数据缺字节，以及两种关闭帧原因截断。
 
-CRYPTO 和 STREAM 的“偏移 + 数据长度”不能超过 `2^62−1`。代码先比较剩余字节和长度，再复制数据；ACK Range Count 先受载荷剩余长度约束，以免畸形计数导致无意义的长循环。`tests/quic_frames.cc` 检查组合帧往返、无 LEN 的 STREAM、空 FIN、ACK/ACK_ECN、新增控制帧、空载荷、截断、未知类型、区间下溢、畸形大计数与数值边界。帧所在的包类型、流方向与流量控制、CRYPTO 加密级别等语义规则仍需连接层实现，不能把“能解析”理解为“可以接受”。
+CRYPTO 和 STREAM 的“偏移 + 数据长度”不能超过 `2^62−1`。代码先比较剩余字节和长度，再复制数据；ACK Range Count 先受载荷剩余长度约束，以免畸形计数导致无意义的长循环。`tests/quic_frames.cc` 检查组合帧往返、无 LEN 的 STREAM、空 FIN、ACK/ACK_ECN、新增控制帧、空载荷、截断、未知类型、区间下溢、畸形大计数与数值边界。流方向、流量控制、ACK 包号空间和 CRYPTO 加密级别等语义规则仍需连接层实现，不能把“能解析”理解为“可以接受”。
+
+### RFC 9000 §12.4–12.5：一帧能放进哪种包
+
+Frame Type 说明**这是什么帧**；包类型又限制**这里能放什么帧**。例如一串 `02 00 00 00 00` 可以是字段完整的 ACK 帧，但把它塞进 0-RTT 包仍不符合规则。现有 `decode_frames()` 不接收包类型，因而可以独立复用；新函数 `frame_allowed_in_packet(frame, packet_kind)` 在解析后执行第二道检查，`frames_allowed_in_packet(frames, packet_kind)` 要求载荷至少一帧，并逐帧检查。两者只返回布尔值，不假装已经产生或发送 CONNECTION_CLOSE。[RFC 9000 §12.4 表 3](https://www.rfc-editor.org/rfc/rfc9000.html#section-12.4)
+
+| 帧类别 | Initial | Handshake | 0-RTT | 1-RTT |
+| --- | :---: | :---: | :---: | :---: |
+| PADDING、PING、传输层 CONNECTION_CLOSE (`1c`) | ✓ | ✓ | ✓ | ✓ |
+| ACK/ACK_ECN、CRYPTO | ✓ | ✓ | — | ✓ |
+| STREAM、RESET_STREAM、STOP_SENDING、额度/阻塞、NEW_CONNECTION_ID、PATH_CHALLENGE、应用层 CONNECTION_CLOSE (`1d`) | — | — | ✓ | ✓ |
+| NEW_TOKEN、RETIRE_CONNECTION_ID、PATH_RESPONSE、HANDSHAKE_DONE | — | — | — | ✓ |
+
+0-RTT 与 1-RTT 使用**同一个应用数据包号空间**，但不意味着它们能携带同样的帧。特别是 ACK、CRYPTO、HANDSHAKE_DONE、NEW_TOKEN、PATH_RESPONSE、RETIRE_CONNECTION_ID 不能放入 0-RTT；规范允许服务器将收到这些帧视为 PROTOCOL_VIOLATION。Initial/Handshake 中只有 `1c` 传输层关闭帧可以出现，`1d` 应用层关闭帧不行。`ConnectionCloseFrame::application` 决定这一区别；若只看 C++ 结构体名字会漏检。[RFC 9000 §12.5](https://www.rfc-editor.org/rfc/rfc9000.html#section-12.5)
+
+处理流程应是“认证包 → 解出完整明文 → `decode_frames` → 检查每帧所在包类型 → 结合连接状态执行帧”。字节格式失败、包类型不允许、ACK 引用了未发送的包等属于不同检查；目前只有前两项各自具备基础接口，并没有能产生协议错误的完整连接处理器。测试把现有全部 20 种 Frame 变体（并将 CONNECTION_CLOSE 的两种形式分开）对四种包类型逐项比对 RFC 表 3，也检查空载荷和合法帧后面藏有非法帧的情况。读完可以自问：为什么 ACK 与 CRYPTO 都能放 1-RTT，但不能放 0-RTT？答案是同属应用数据包号空间只说明**包号如何编号与确认**，不取消 0-RTT 的帧放置限制。
 
 ## RFC 9001 §5.4：报头保护的掩码操作
 
@@ -293,7 +308,7 @@ PTO（Probe Timeout）是“等待确认过久时，什么时候尝试发探测�
 
 | 规范范围 | 已有的可调用代码 | 必须继续实现的内容 |
 | --- | --- | --- |
-| RFC 9000 | 变长整数、包号数值编解码、部分 v1 受保护包头、VN 构造与解析、Retry 字段解析、`0x00`–`0x1e` 核心帧线上格式 | VN 接受逻辑、Retry 完整性验证及发送、扩展帧、三类包号空间、帧合法性、流与流量控制、连接与迁移状态、UDP 数据报组装 |
+| RFC 9000 | 变长整数、包号数值编解码、部分 v1 受保护包头、VN 构造与解析、Retry 字段解析、`0x00`–`0x1e` 核心帧线上格式与按包类型放置检查 | VN 接受逻辑、Retry 完整性验证及发送、扩展帧、三类包号空间、方向/角色与流量控制等帧语义、连接与迁移状态、UDP 数据报组装 |
 | RFC 9001 | 已给定 mask 时的报头异或与样本位置 | TLS 1.3 集成、Initial/Handshake/1-RTT 密钥、mask 生成、AEAD 加解密与认证、密钥更新和丢弃 |
 | RFC 9002 | RTT 估计、PTO 基础时长 | ACK 处理、发包记录、丢包判断、PTO 定时器与退避、拥塞控制及 ECN 验证 |
 
@@ -308,7 +323,7 @@ PTO（Probe Timeout）是“等待确认过久时，什么时候尝试发探测�
 | `varint` | RFC 9000 §16、附录 A.1；长度边界、非最短编码与截断 | 现有实现和测试中的行为与对照规则一致 |
 | `packet_number` | RFC 9000 §17.1、附录 A.2/A.3；半窗口、回绕与 62 位上限 | 现有数值接口与对照规则一致；包号空间管理尚不存在 |
 | `packet_header` | RFC 9000 §17.2–17.3、RFC 9001 §5.4；v1 包型、CID、Length、样本可用性 | 已实现受保护包头布局、VN 线上格式和 Retry 字段解析；客户端接受规则与 Retry tag 验证尚未实现 |
-| `frame` | RFC 9000 §12.4、§19.1–19.20；长度、ACK gap、流终点、控制帧长度和本地数值界限 | 核心帧的线上字段已编码和解析；帧上下文、扩展帧与连接语义未实现 |
+| `frame` | RFC 9000 §12.4–12.5、§19.1–19.20；长度、ACK gap、流终点、包类型限制和本地数值界限 | 核心帧线上字段与按包类型放置规则已实现；角色、方向、包号空间内容及连接语义未实现 |
 | `header_protection` | RFC 9001 §5.4；样本位置、首字节掩码宽度、收发操作顺序 | 已给定 mask 时的基础操作与对照规则一致；样本生成和完整包认证未实现 |
 | `rtt_estimator` | RFC 9002 §5.3、§6.2.1 与勘误 7539；ACK Delay、更新顺序、PTO | 修正一处变动值更新顺序；ACK 处理与定时器未实现 |
 
