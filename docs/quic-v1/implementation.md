@@ -1,6 +1,6 @@
 # QUIC v1 实现讲解（进行中）
 
-当前完成 RFC 9000 §16 的变长整数、§17.1 的包号编解码、§19 部分基础帧编解码、RFC 9001 §5.4 的报头掩码基础操作，以及 RFC 9002 §5 的 RTT 估计和 §6.2.1 的 PTO 时长计算。它们还没有组成 QUIC 连接；TLS、AEAD、完整包头与其余帧、ACK 与丢包状态机、UDP 互通仍未完成。最终以完整协议代码、测试和 `coverage.md` 为准。
+当前完成 RFC 9000 §16 的变长整数、§17.1 的包号编解码、§17.2–17.3 的部分受保护包头布局、§19 的部分基础帧编解码、RFC 9001 §5.4 的报头掩码基础操作，以及 RFC 9002 §5 的 RTT 估计和 §6.2.1 的 PTO 时长计算。它们还没有组成 QUIC 连接；TLS、AEAD、版本协商与 Retry、其余帧、ACK 与丢包状态机、UDP 互通仍未完成。最终以完整协议代码、测试和 `coverage.md` 为准。
 
 ## RFC 9000 §16：变长整数
 
@@ -19,6 +19,18 @@ QUIC 的变长整数使用首字节最高两位表示总长度：`00` 为 1 字�
 `quic/packet_number.hh/.cc` 选择 1–4 字节的包号字段，只发送完整包号的低位字节。发送端依据当前包号与该包号空间的最大已确认包号选择足够宽的字段；未收到 ACK 时，字段必须装下完整包号，例如包号 128 仍只需一字节，超过四字节可表示的范围则拒绝编码。接收端在报头保护移除后，以“最大已成功认证包号 + 1”为期望值，恢复最接近期望值的完整包号。测试包括 RFC 9000 附录 A.2 的 `0xac5c02` / `0xabe8b3` 长度示例与附录 A.3 的 `0xa82f9b32` 解码示例。
 
 这个模块只做数字编解码。调用方仍必须为 Initial、Handshake、Application Data 维护独立包号空间，并保证每个空间的发送包号单调且不复用。接收方仍须在认证后处理重复包；这些状态机尚未实现。输入超出 62 位范围、字段长度不是 1–4 字节或长度不足以安全表达当前未确认范围时，函数拒绝操作。
+
+## RFC 9000 §17.2–17.3：受保护包头的布局
+
+QUIC 可以把多个长包头包放进同一个 UDP 数据报。要解密其中一个包，接收端先要知道它从哪里开始、在哪里结束、包号字段从哪个字节开始。长包头的 `Length` 字段解决包边界问题：它表示**包号字段加密文载荷**的总字节数，不包括 `Length` 字段本身。短包头没有这个长度字段，所以从其起点一直占用数据报剩余部分。[RFC 9000 §17.2](https://www.rfc-editor.org/rfc/rfc9000.html#section-17.2)、[§17.3.1](https://www.rfc-editor.org/rfc/rfc9000.html#section-17.3.1)
+
+`quic/packet_header.hh/.cc` 的 `parse_protected_packet()` 从未加密字段读出版本、目的/源连接 ID、Initial Token 和长包头 Length，返回包类型、包号字段起点 `pn_offset` 与包结束位置 `packet_end`。再次以 `packet_end` 为起点调用即可定位下一个拼接的长包头包。短包头的目的连接 ID **没有长度字节**，因此调用者必须从连接状态传入 `short_dcid_length`。两个连接 ID 的 v1 长度均限制为 20 字节；超过界限、字段截断或 Length 超出数据报都拒绝解析。当前接口只接受 v1 Initial、0-RTT、Handshake 和 1-RTT；版本协商包与 Retry 包格式不同，交由后续模块处理。
+
+为什么这里不直接读包号？包号长度写在首字节低两位，但这两位已经被 RFC 9001 的报头保护掩盖。解析器只读首字节的长/短格式、固定位和长包头类型，**不使用低位计算包号长度，也不提前检查保留位**。后续应在 `pn_offset + 4` 取 16 字节样本，生成报头掩码，恢复首字节与包号，再用完整包号解开 AEAD，认证成功后才验证保留位和更新接收状态。为保证样本存在，布局解析器要求从 `pn_offset` 到包末尾至少 20 字节。[RFC 9001 §5.4](https://www.rfc-editor.org/rfc/rfc9001.html#section-5.4)
+
+发送端用 `build_long_header()` 或 `build_short_header()` 构造**尚未保护的**包头和 1–4 字节截断包号。两者都要求调用者提供将来的密文及 AEAD tag 长度 `protected_payload_length`，用它检查样本长度；长包头还会计算 `Length = 包号字节数 + protected_payload_length`。这段未保护包头将来要作为 AEAD 的 associated data；密文生成后才应用报头保护。RFC 9001 附录 A.2 的 Initial 包头 `c3 00 00 00 01 ... 44 9e 00 00 00 02` 是测试向量：包号起点为字节 18，`44 9e` 编出的 Length 为 1182，整个包长为 1200 字节。[RFC 9001 附录 A.2](https://www.rfc-editor.org/rfc/rfc9001.html#appendix-A.2)
+
+`tests/quic_packet_header.cc` 还验证拼接的 Handshake 包、0-RTT 包、带 Token 的 Initial、1-RTT 短包头，以及损坏的连接 ID、Token、Length、版本和固定位。构造函数不会分配包号、不会加密或认证，也不会生成 Retry 完整性标签；本模块的“布局正确”不能当作真实网络包已经有效。
 
 ## RFC 9000 §19：基础帧编解码
 
@@ -44,4 +56,4 @@ CRYPTO 和 STREAM 的“偏移 + 数据长度”不能超过 `2^62−1`。代码
 
 调用者必须确保 ACK 帧中的 Largest Acknowledged 包是新确认的，且这次 ACK 至少新确认了一个会引发 ACK 的包，才调用 `observe()`。RTT 样本取自 Largest Acknowledged 包的发送时间；这个包本身可以不引发 ACK。该 ACK 处理器尚未实现。这里也没有实现 PTO 定时器、指数退避、包号空间选择或丢包判定。测试覆盖首次样本、ACK delay 上下限、未确认握手的应用 PTO、路径重置和非法输入。
 
-验证：`quic_packet_primitives_sanitized` 与原有 `quic_varint_sanitized` 在 Debug CTest 中通过；每个新模块的测试先观察到缺失实现的失败，再补充实现。独立代码审查指出 ACK 取样契约的注释错误和 ACK delay 上限测试没有真正区分分支，均已修正。基础帧测试也先观察到未定义接口的链接失败，再观察到 ACK 尚未支持时的断言失败，然后分别完成实现；审查发现空载荷处理与 62 位边界测试遗漏后，又补充回归用例。全量 `ctest --timeout 12` 共 42 项，35 项通过；五项原有 TCP/整数压力测试超时，`net_interface` 和 `router` 因本分支尚未含相应测试程序而未运行。因此全量测试仍未通过，不能把新增 QUIC 测试的通过外推为整个项目通过。详细任务见 `docs/superpowers/plans/2026-10-19-quic-packet-primitives.md` 与 `2026-10-19-quic-basic-frames.md`。
+验证：包号、报头掩码、RTT、基础帧和包头布局模块的 Debug QUIC 定向测试通过；新增模块均先观察到缺失实现的测试失败，再补充实现。独立审查指出 ACK 取样契约、ACK delay 上限测试、空载荷处理、62 位边界测试以及短包头样本长度检查的问题，均已修正。全量 `ctest --timeout 12` 共 43 项，36 项通过；五项原有 TCP/整数压力测试超时，`net_interface` 和 `router` 因本分支尚未含相应测试程序而未运行。因此全量测试仍未通过，不能把新增 QUIC 测试的通过外推为整个项目通过。详细任务见 `docs/superpowers/plans/2026-10-19-quic-packet-primitives.md`、`2026-10-19-quic-basic-frames.md` 与 `2026-10-19-quic-packet-header.md`。
