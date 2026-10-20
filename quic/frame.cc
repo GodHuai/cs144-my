@@ -8,6 +8,8 @@
 namespace quic {
 
 namespace {
+constexpr uint64_t max_stream_count = uint64_t { 1 } << 60;
+
 bool valid_end( const uint64_t offset, const size_t length )
 {
   return offset <= max_varint && length <= max_varint - offset;
@@ -74,6 +76,21 @@ std::optional<std::vector<Frame>> decode_frames( const std::string_view payload 
         ack.ecn = EcnCounts { *ect0, *ect1, *ce };
       }
       frames.emplace_back( std::move( ack ) );
+    } else if ( type == 4 ) {
+      const auto stream_id = decode_varint( payload, cursor );
+      const auto error_code = decode_varint( payload, cursor );
+      const auto final_size = decode_varint( payload, cursor );
+      if ( !stream_id || !error_code || !final_size ) {
+        return std::nullopt;
+      }
+      frames.emplace_back( ResetStreamFrame { *stream_id, *error_code, *final_size } );
+    } else if ( type == 5 ) {
+      const auto stream_id = decode_varint( payload, cursor );
+      const auto error_code = decode_varint( payload, cursor );
+      if ( !stream_id || !error_code ) {
+        return std::nullopt;
+      }
+      frames.emplace_back( StopSendingFrame { *stream_id, *error_code } );
     } else if ( type == 6 ) {
       const auto offset = decode_varint( payload, cursor );
       const auto length = decode_varint( payload, cursor );
@@ -107,6 +124,37 @@ std::optional<std::vector<Frame>> decode_frames( const std::string_view payload 
       }
       frames.emplace_back(
         StreamFrame { *stream_id, offset, std::move( *data ), bool( type & 1 ), offset_present, length_present } );
+    } else if ( type == 0x10 || type == 0x14 ) {
+      const auto maximum_data = decode_varint( payload, cursor );
+      if ( !maximum_data ) {
+        return std::nullopt;
+      }
+      if ( type == 0x10 ) {
+        frames.emplace_back( MaxDataFrame { *maximum_data } );
+      } else {
+        frames.emplace_back( DataBlockedFrame { *maximum_data } );
+      }
+    } else if ( type == 0x11 || type == 0x15 ) {
+      const auto stream_id = decode_varint( payload, cursor );
+      const auto maximum_data = decode_varint( payload, cursor );
+      if ( !stream_id || !maximum_data ) {
+        return std::nullopt;
+      }
+      if ( type == 0x11 ) {
+        frames.emplace_back( MaxStreamDataFrame { *stream_id, *maximum_data } );
+      } else {
+        frames.emplace_back( StreamDataBlockedFrame { *stream_id, *maximum_data } );
+      }
+    } else if ( type == 0x12 || type == 0x13 || type == 0x16 || type == 0x17 ) {
+      const auto maximum_streams = decode_varint( payload, cursor );
+      if ( !maximum_streams || *maximum_streams > max_stream_count ) {
+        return std::nullopt;
+      }
+      if ( type == 0x12 || type == 0x13 ) {
+        frames.emplace_back( MaxStreamsFrame { bool( type & 1 ), *maximum_streams } );
+      } else {
+        frames.emplace_back( StreamsBlockedFrame { bool( type & 1 ), *maximum_streams } );
+      }
     } else {
       return std::nullopt;
     }
@@ -149,6 +197,29 @@ std::string encode_frame( const Frame& frame )
         }
         result += value.data;
         return result;
+      } else if constexpr ( std::is_same_v<T, ResetStreamFrame> ) {
+        return std::string( 1, '\x04' ) + encode_varint( value.stream_id ) + encode_varint( value.error_code )
+               + encode_varint( value.final_size );
+      } else if constexpr ( std::is_same_v<T, StopSendingFrame> ) {
+        return std::string( 1, '\x05' ) + encode_varint( value.stream_id ) + encode_varint( value.error_code );
+      } else if constexpr ( std::is_same_v<T, MaxDataFrame> ) {
+        return std::string( 1, '\x10' ) + encode_varint( value.maximum_data );
+      } else if constexpr ( std::is_same_v<T, MaxStreamDataFrame> ) {
+        return std::string( 1, '\x11' ) + encode_varint( value.stream_id ) + encode_varint( value.maximum_data );
+      } else if constexpr ( std::is_same_v<T, MaxStreamsFrame> ) {
+        if ( value.maximum_streams > max_stream_count ) {
+          throw std::out_of_range( "MAX_STREAMS exceeds 2^60" );
+        }
+        return std::string( 1, value.unidirectional ? '\x13' : '\x12' ) + encode_varint( value.maximum_streams );
+      } else if constexpr ( std::is_same_v<T, DataBlockedFrame> ) {
+        return std::string( 1, '\x14' ) + encode_varint( value.maximum_data );
+      } else if constexpr ( std::is_same_v<T, StreamDataBlockedFrame> ) {
+        return std::string( 1, '\x15' ) + encode_varint( value.stream_id ) + encode_varint( value.maximum_data );
+      } else if constexpr ( std::is_same_v<T, StreamsBlockedFrame> ) {
+        if ( value.maximum_streams > max_stream_count ) {
+          throw std::out_of_range( "STREAMS_BLOCKED exceeds 2^60" );
+        }
+        return std::string( 1, value.unidirectional ? '\x17' : '\x16' ) + encode_varint( value.maximum_streams );
       } else {
         if ( value.ranges.empty() || value.ranges.front().largest > max_varint ) {
           throw std::invalid_argument( "ACK needs a valid first range" );

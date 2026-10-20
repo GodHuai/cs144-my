@@ -1,6 +1,6 @@
 # QUIC v1 实现讲解（进行中）
 
-当前完成 RFC 9000 §16 的变长整数、§17.1 的包号编解码、§17.2–17.3 的部分受保护包头布局、§19 的部分基础帧编解码、RFC 9001 §5.4 的报头掩码基础操作，以及 RFC 9002 §5 的 RTT 估计和 §6.2.1 的 PTO 时长计算。它们还没有组成 QUIC 连接；TLS、AEAD、版本协商与 Retry、其余帧、ACK 与丢包状态机、UDP 互通仍未完成。最终以完整协议代码、测试和 `coverage.md` 为准。
+当前完成 RFC 9000 §16 的变长整数、§17.1 的包号编解码、§17.2–17.3 的部分受保护包头布局、§19 的部分帧编解码（包括流停止、额度与阻塞帧）、RFC 9001 §5.4 的报头掩码基础操作，以及 RFC 9002 §5 的 RTT 估计和 §6.2.1 的 PTO 时长计算。它们还没有组成 QUIC 连接；TLS、AEAD、版本协商与 Retry、其余帧、ACK 与丢包状态机、UDP 互通仍未完成。最终以完整协议代码、测试和 `coverage.md` 为准。
 
 这份笔记按初学者能逐步手算的顺序编写：每节先说 RFC 规定什么，再解释为什么，最后回到当前 C++ 源码。笔记中的代码片段只摘取决定行为的语句；完整可编译代码以相应 `quic/*.hh`、`quic/*.cc` 和 `tests/quic_*.cc` 为准，避免复制一份会随实现变化而失真的源码。
 
@@ -142,15 +142,21 @@ layout.packet_end = cursor + static_cast<size_t>( *length );
 
 QUIC 包通过帧传递控制信息和数据。可以把一个包的明文载荷想成若干张接在一起的“小纸条”：每张先写帧类型，再写该类型约定的字段。接收方必须知道一张纸条在哪里结束，才能找到下一张。`quic/frame.hh/.cc` 的 `decode_frames()` 接收**已经完成 AEAD 认证**的整段载荷，依次解码并返回 `Frame` 列表；空载荷或任何一处格式错误都返回空值，不把已经读出的前缀交给连接层。`encode_frame()` 把单个结构化帧还原成线上字节。[RFC 9000 §12.4](https://www.rfc-editor.org/rfc/rfc9000.html#section-12.4)
 
-目前支持五类帧：PADDING 是一个 `0x00` 字节，可连续出现，解码后合并为长度；PING 是 `0x01`，没有后续字段；CRYPTO 是 `0x06`，依次写握手数据的 Offset、Length、Data；STREAM 类型为 `0x08` 至 `0x0f`，最低三位分别决定是否有 Offset、Length 和 FIN；ACK 是 `0x02`，ACK_ECN 是 `0x03`。除类型外，各整数均调用已有的 QUIC 变长整数编解码器。帧类型必须用最短长度，本轮支持的类型都只占一字节；未知类型和非最短类型会使整段解析失败。[RFC 9000 §19](https://www.rfc-editor.org/rfc/rfc9000.html#section-19)
+当前支持 PADDING、PING、ACK/ACK_ECN、RESET_STREAM、STOP_SENDING、CRYPTO、STREAM，以及 `0x10`–`0x17` 的额度与阻塞帧。除类型外，各整数均调用已有的 QUIC 变长整数编解码器。帧类型必须用最短长度，本轮支持的类型都只占一字节；未知类型和非最短类型会使整段解析失败。[RFC 9000 §19](https://www.rfc-editor.org/rfc/rfc9000.html#section-19)
 
 | 帧 | 类型字节 | 主要字段 | 当前代码的表示 |
 | --- | --- | --- | --- |
 | PADDING | `00` | 无；每字节都是一个帧 | `PaddingFrame{length}` 合并连续 0 |
 | PING | `01` | 无 | `PingFrame` |
 | ACK / ACK_ECN | `02` / `03` | 最大包号、延迟、区间、可选 ECN 计数 | `AckFrame{ack_delay, ranges, ecn}` |
+| RESET_STREAM | `04` | 流 ID、应用错误码、最终大小 | `ResetStreamFrame` |
+| STOP_SENDING | `05` | 流 ID、应用错误码 | `StopSendingFrame` |
 | CRYPTO | `06` | 偏移、长度、TLS 握手字节 | `CryptoFrame{offset, data}` |
 | STREAM | `08`–`0f` | 流 ID、可选偏移/长度、FIN、字节 | `StreamFrame` |
+| MAX_DATA / MAX_STREAM_DATA | `10` / `11` | 连接额度；或流 ID 与该流额度 | `MaxDataFrame` / `MaxStreamDataFrame` |
+| MAX_STREAMS | `12` / `13` | 双向或单向流的累计可开数量 | `MaxStreamsFrame` |
+| DATA_BLOCKED / STREAM_DATA_BLOCKED | `14` / `15` | 被阻塞时的连接额度；或流 ID 与额度 | `DataBlockedFrame` / `StreamDataBlockedFrame` |
+| STREAMS_BLOCKED | `16` / `17` | 双向或单向流的阻塞数量上限 | `StreamsBlockedFrame` |
 
 `Frame` 是以上结构体的 `std::variant`。`decode_frames()` 只解析格式；例如它能解析出一个 STREAM 帧，却不知道这个流是否允许对端发送、是否超出流量控制额度。只有将来连接层结合包类型和流状态才能决定是否接受。尤其 Initial/Handshake、0-RTT、1-RTT 允许的帧集合不同，当前解析器尚未检查。[RFC 9000 §12.5](https://www.rfc-editor.org/rfc/rfc9000.html#section-12.5)
 
@@ -182,7 +188,17 @@ ack.ranges.push_back( AckRange { range_largest - *length, range_largest } );
 
 两次先比较再减法，是为了防止无符号整数下溢。例如前一区间最小包号只有 1，却宣称还隔着两个未确认包，计算会变成负包号；C++ 的 `uint64_t` 不会产生负数，而会绕成巨大正数。解析器必须在这一步拒绝畸形 ACK。
 
-CRYPTO 和 STREAM 的“偏移 + 数据长度”不能超过 `2^62−1`。代码先比较剩余字节和长度，再复制数据；ACK Range Count 先受载荷剩余长度约束，以免畸形计数导致无意义的长循环。`tests/quic_frames.cc` 检查组合帧往返、无 LEN 的 STREAM、空 FIN、ACK/ACK_ECN、空载荷、截断、未知类型、区间下溢、畸形大计数与 62 位偏移边界。帧所在的包类型、流方向与流量控制、CRYPTO 加密级别等语义规则仍需连接层实现，不能把“能解析”理解为“可以接受”。
+### 新增流停止与额度帧：先读线上的字节
+
+`RESET_STREAM` 是发送方结束自己那一侧的流：`04 25 02 40 40` 依次表示类型 `04`、流 ID 37 (`25`)、应用错误码 2、最终大小 64 (`40 40`)。`STOP_SENDING` 是接收方请求对端停止发送：`05 03 25` 表示流 ID 3、应用错误码 37。两者看似相近，方向不同；是否允许针对某条流发送、收到后如何处理数据，必须由将来的流状态机判断。[RFC 9000 §19.4](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.4)、[§19.5](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.5)
+
+额度帧把“可以发送多少”写成**绝对上限**，而阻塞帧报告自己卡在什么上限。`10 40 40` 表示连接最多允许 64 字节；`11 03 25` 表示流 3 最多允许 37 字节。`14 40 40` 和 `15 03 25` 则是发送方分别报告连接级和流级阻塞，不会自动增加额度。实际连接层收到较小的 `MAX_DATA`、`MAX_STREAM_DATA` 时应忽略，不应把额度降回去；这些状态更新不属于当前编解码器。[RFC 9000 §4.1](https://www.rfc-editor.org/rfc/rfc9000.html#section-4.1)、[§19.9–19.13](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.9)
+
+`MAX_STREAMS` 的 `12` / `13` 与 `STREAMS_BLOCKED` 的 `16` / `17` 用**类型字节**区分双向和单向；后面的整数都是可开流的累计数量，不是已经开了多少条。流 ID 只有 62 位，其中最低两位是发起方和方向，因此数量上限是 `2^60`，超过它的 `MAX_STREAMS` 或 `STREAMS_BLOCKED` 会被解码器拒绝。[RFC 9000 §19.11](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.11)、[§19.14](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.14)
+
+源码中两字段帧先连续调用两次 `decode_varint()`，三字段的 RESET_STREAM 调用三次；任一字段截断则 `decode_frames()` 丢弃整段帧列表。`0x12`、`0x13`、`0x16`、`0x17` 共用一次 `maximum_streams <= 2^60` 检查，随后以类型最低位填充 `unidirectional`。测试把八种额度/阻塞帧顺序拼在同一载荷中，检查每个字段并比对重新编码后的字节；这样能抓到“多吃了下一个帧的字节”的错误。还检查了流数量零、`2^60` 上限、`2^60+1` 拒绝和已有 PING 后截断时不返回部分结果。
+
+CRYPTO 和 STREAM 的“偏移 + 数据长度”不能超过 `2^62−1`。代码先比较剩余字节和长度，再复制数据；ACK Range Count 先受载荷剩余长度约束，以免畸形计数导致无意义的长循环。`tests/quic_frames.cc` 检查组合帧往返、无 LEN 的 STREAM、空 FIN、ACK/ACK_ECN、新增控制帧、空载荷、截断、未知类型、区间下溢、畸形大计数与数值边界。帧所在的包类型、流方向与流量控制、CRYPTO 加密级别等语义规则仍需连接层实现，不能把“能解析”理解为“可以接受”。
 
 ## RFC 9001 §5.4：报头保护的掩码操作
 
@@ -274,7 +290,7 @@ ctest --test-dir build -R '^quic_' --output-on-failure
 ctest --test-dir build --output-on-failure -j2
 ```
 
-本次复核的 QUIC 定向测试（含公共编译夹具）为 **5/5 通过**。无额外的 12 秒超时限制时，全量 CTest **43 项中 41 项通过**；`net_interface` 与 `router` 因缺少相应的测试可执行文件而未运行，因此全量测试命令退出状态为 8。该全量运行与 RTT 修复有时间重叠，最终提交前还需重跑 QUIC 定向测试以确认当前源码。这组数字是运行记录，不会随着文档编辑自动更新。
+新增控制帧并格式化后，QUIC 定向测试（含公共编译夹具）为 **5/5 通过**。同一源码下、无额外 12 秒超时限制的全量 CTest **43 项中 41 项通过**；`net_interface` 与 `router` 因缺少相应的测试可执行文件而未运行，因此全量测试命令退出状态为 8。这组数字是运行记录，不会随着文档编辑自动更新。
 
 代码实现时使用测试先行：先看见缺少接口、缺少 ACK 支持或空载荷缺陷使测试失败，再补实现。独立审查发现的 ACK 取样条件、ACK Delay 上限测试、62 位边界与短包头样本长度问题已修正。本次复核又发现 RTT 变动值与 RFC 9002 勘误的顺序不符：先将断言改为 40 ms，观察到 `quic_packet_primitives` 因得到旧结果 39.6875 ms 而失败；再调整实现顺序，定向测试恢复通过。各里程碑的任务与具体测试范围记录在 `docs/superpowers/plans/2026-10-19-quic-packet-primitives.md`、`2026-10-19-quic-basic-frames.md` 和 `2026-10-19-quic-packet-header.md`。
 

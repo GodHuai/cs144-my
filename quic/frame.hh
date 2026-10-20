@@ -30,6 +30,45 @@ struct StreamFrame
   bool offset_present;
   bool length_present;
 };
+struct ResetStreamFrame
+{
+  uint64_t stream_id;
+  uint64_t error_code;
+  uint64_t final_size;
+};
+struct StopSendingFrame
+{
+  uint64_t stream_id;
+  uint64_t error_code;
+};
+struct MaxDataFrame
+{
+  uint64_t maximum_data;
+};
+struct MaxStreamDataFrame
+{
+  uint64_t stream_id;
+  uint64_t maximum_data;
+};
+struct MaxStreamsFrame
+{
+  bool unidirectional;
+  uint64_t maximum_streams;
+};
+struct DataBlockedFrame
+{
+  uint64_t maximum_data;
+};
+struct StreamDataBlockedFrame
+{
+  uint64_t stream_id;
+  uint64_t maximum_data;
+};
+struct StreamsBlockedFrame
+{
+  bool unidirectional;
+  uint64_t maximum_streams;
+};
 struct AckRange
 {
   uint64_t smallest;
@@ -48,7 +87,19 @@ struct AckFrame
   std::optional<EcnCounts> ecn;
 };
 
-using Frame = std::variant<PaddingFrame, PingFrame, CryptoFrame, StreamFrame, AckFrame>;
+using Frame = std::variant<PaddingFrame,
+                           PingFrame,
+                           CryptoFrame,
+                           StreamFrame,
+                           AckFrame,
+                           ResetStreamFrame,
+                           StopSendingFrame,
+                           MaxDataFrame,
+                           MaxStreamDataFrame,
+                           MaxStreamsFrame,
+                           DataBlockedFrame,
+                           StreamDataBlockedFrame,
+                           StreamsBlockedFrame>;
 
 std::optional<std::vector<Frame>> decode_frames( std::string_view payload );
 std::string encode_frame( const Frame& frame );

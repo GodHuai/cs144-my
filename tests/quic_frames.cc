@@ -1,5 +1,6 @@
 #include "quic/frame.hh"
 
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -81,4 +82,68 @@ int main()
   require( !decode_frames( std::string( "\x02\x02\x00\x01\x00\x01\x00", 7 ) ), "ACK gap underflow" );
   require( !decode_frames( std::string( "\x02\x0a\x00\x3f\x00", 5 ) ), "huge ACK range count with short payload" );
   require( !decode_frames( std::string( "\x03\x01\x00\x00\x00\x01\x02", 7 ) ), "truncated ECN counts" );
+
+  // RFC 9000 §§19.4-19.5: all fields are QUIC varints, in wire order.
+  const std::string reset_wire { "\x04\x25\x02\x40\x40", 5 }; // stream 37, error 2, final size 64
+  const auto reset_frames = decode_frames( reset_wire );
+  require( reset_frames && reset_frames->size() == 1, "RESET_STREAM decoded" );
+  const auto& reset = std::get<ResetStreamFrame>( reset_frames->front() );
+  require( reset.stream_id == 37 && reset.error_code == 2 && reset.final_size == 64, "RESET_STREAM fields" );
+  require( encode_frame( reset_frames->front() ) == reset_wire, "RESET_STREAM encoded bytes" );
+
+  const std::string stop_wire { "\x05\x03\x25", 3 }; // stream 3, error 37
+  const auto stop_frames = decode_frames( stop_wire );
+  require( stop_frames && stop_frames->size() == 1, "STOP_SENDING decoded" );
+  const auto& stop = std::get<StopSendingFrame>( stop_frames->front() );
+  require( stop.stream_id == 3 && stop.error_code == 37, "STOP_SENDING fields" );
+  require( encode_frame( stop_frames->front() ) == stop_wire, "STOP_SENDING encoded bytes" );
+  require( !decode_frames( std::string( "\x01\x04\x00\x00", 4 ) ), "truncated RESET_STREAM kept PING prefix" );
+  require( !decode_frames( std::string( "\x05\x01", 2 ) ), "truncated STOP_SENDING accepted" );
+
+  // RFC 9000 §§19.9-19.14: each control frame must leave the cursor at the next type byte.
+  const std::string credit_wire { "\x10\x40\x40\x11\x03\x25\x12\x02\x13\x00"
+                                  "\x14\x40\x40\x15\x03\x25\x16\x02\x17\x00",
+                                  20 };
+  const auto credit_frames = decode_frames( credit_wire );
+  require( credit_frames && credit_frames->size() == 8, "credit and blocked frame sequence decoded" );
+  require( std::get<MaxDataFrame>( ( *credit_frames )[0] ).maximum_data == 64, "MAX_DATA field" );
+  const auto& max_stream_data = std::get<MaxStreamDataFrame>( ( *credit_frames )[1] );
+  require( max_stream_data.stream_id == 3 && max_stream_data.maximum_data == 37, "MAX_STREAM_DATA fields" );
+  require( !std::get<MaxStreamsFrame>( ( *credit_frames )[2] ).unidirectional
+             && std::get<MaxStreamsFrame>( ( *credit_frames )[2] ).maximum_streams == 2,
+           "bidirectional MAX_STREAMS" );
+  require( std::get<MaxStreamsFrame>( ( *credit_frames )[3] ).unidirectional
+             && std::get<MaxStreamsFrame>( ( *credit_frames )[3] ).maximum_streams == 0,
+           "unidirectional MAX_STREAMS zero" );
+  require( std::get<DataBlockedFrame>( ( *credit_frames )[4] ).maximum_data == 64, "DATA_BLOCKED field" );
+  const auto& stream_blocked = std::get<StreamDataBlockedFrame>( ( *credit_frames )[5] );
+  require( stream_blocked.stream_id == 3 && stream_blocked.maximum_data == 37, "STREAM_DATA_BLOCKED fields" );
+  require( !std::get<StreamsBlockedFrame>( ( *credit_frames )[6] ).unidirectional
+             && std::get<StreamsBlockedFrame>( ( *credit_frames )[6] ).maximum_streams == 2,
+           "bidirectional STREAMS_BLOCKED" );
+  require( std::get<StreamsBlockedFrame>( ( *credit_frames )[7] ).unidirectional
+             && std::get<StreamsBlockedFrame>( ( *credit_frames )[7] ).maximum_streams == 0,
+           "unidirectional STREAMS_BLOCKED zero" );
+  std::string credit_encoded;
+  for ( const auto& frame : *credit_frames ) {
+    credit_encoded += encode_frame( frame );
+  }
+  require( credit_encoded == credit_wire, "credit and blocked frame wire bytes" );
+
+  const std::string stream_limit_max = std::string( "\x12\xd0", 2 ) + std::string( 7, '\0' );
+  const auto max_streams = decode_frames( stream_limit_max );
+  require( max_streams
+             && std::get<MaxStreamsFrame>( max_streams->front() ).maximum_streams == ( uint64_t { 1 } << 60 ),
+           "MAX_STREAMS 2^60 boundary" );
+  require( !decode_frames( stream_limit_max + std::string( "\x17\xd0\x00\x00\x00\x00\x00\x00\x01", 9 ) ),
+           "STREAMS_BLOCKED 2^60+1 accepted" );
+  require( !decode_frames( std::string( "\x01\x11\x03", 3 ) ), "truncated MAX_STREAM_DATA kept PING prefix" );
+
+  bool rejected_limit = false;
+  try {
+    encode_frame( MaxStreamsFrame { true, ( uint64_t { 1 } << 60 ) + 1 } );
+  } catch ( const std::out_of_range& ) {
+    rejected_limit = true;
+  }
+  require( rejected_limit, "oversize MAX_STREAMS encoded" );
 }
