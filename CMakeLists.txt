@@ -18,6 +18,8 @@ include(etc/tests.cmake)
 include_directories("${PROJECT_SOURCE_DIR}/util")
 include_directories("${PROJECT_SOURCE_DIR}/src")
 
+find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
+
 add_subdirectory("${PROJECT_SOURCE_DIR}/util")
 add_subdirectory("${PROJECT_SOURCE_DIR}/src")
 add_subdirectory("${PROJECT_SOURCE_DIR}/quic")

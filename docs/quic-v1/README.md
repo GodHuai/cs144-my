@@ -11,6 +11,7 @@
    [anti-amplification.md](anti-amplification.md) 解释未验证地址的三倍发送额度。
    [connection-ids.md](connection-ids.md) 解释迁移时使用、退休和替换连接 ID。
    [local-connection-ids.md](local-connection-ids.md) 解释本端签发连接 ID、处理对端退休帧和路由入口。
+   [initial-packet-protection.md](initial-packet-protection.md) 手算 Initial 密钥、AES-GCM 载荷和报头掩码。
 3. [coverage.md](coverage.md)：查某条规范现在有代码、有测试，还是尚未开始。
 4. [design.md](design.md) 与 [tasks.md](tasks.md)：完整连接的目标架构和后续工作顺序；它们是计划，不是当前实现证据。
 5. `docs/superpowers/specs/`、`docs/superpowers/plans/`：每一轮小功能的设计与测试记录。
@@ -29,8 +30,11 @@
 | 换路径时怎样使用对端提供的新连接 ID？ | RFC 9000 §5.1、§9.5 | [peer_connection_ids.hh](../../quic/peer_connection_ids.hh)、[peer_connection_ids.cc](../../quic/peer_connection_ids.cc) | [quic_peer_connection_ids.cc](../../tests/quic_peer_connection_ids.cc) |
 | 怎样签发供对端使用的连接 ID，并处理其退休请求？ | RFC 9000 §5.1.1、§19.16 | [local_connection_ids.hh](../../quic/local_connection_ids.hh)、[local_connection_ids.cc](../../quic/local_connection_ids.cc) | [quic_local_connection_ids.cc](../../tests/quic_local_connection_ids.cc) |
 | 报头保护为什么先取样、再恢复包号长度？ | RFC 9001 §5.4 | [header_protection.hh](../../quic/header_protection.hh)、[header_protection.cc](../../quic/header_protection.cc) | [quic_packet_primitives.cc](../../tests/quic_packet_primitives.cc) |
+| Initial 包怎样派生密钥并保护载荷？ | RFC 9001 §5.1–5.4 | [initial_keys.hh](../../quic/initial_keys.hh)、[initial_keys.cc](../../quic/initial_keys.cc) | [quic_initial_keys.cc](../../tests/quic_initial_keys.cc) |
 | 收到 ACK 后如何更新 RTT 和 PTO？ | RFC 9002 §5–6 | [rtt_estimator.hh](../../quic/rtt_estimator.hh)、[rtt_estimator.cc](../../quic/rtt_estimator.cc) | [quic_packet_primitives.cc](../../tests/quic_packet_primitives.cc) |
 
 ## 一句话检查当前边界
 
 可以编码和解析部分 QUIC v1 字段；**还不能发送或接收一个经过 TLS 与 AEAD 认证的完整 QUIC 连接**。缺失内容和逐项状态以 [coverage.md](coverage.md) 为准。
+
+构建 QUIC 加密模块需要 OpenSSL 3 的开发头文件与 `libcrypto`；CMake 会检查此依赖。

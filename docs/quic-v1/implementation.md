@@ -1,6 +1,6 @@
 # QUIC v1 实现讲解（进行中）
 
-当前完成 RFC 9000 §16 的变长整数、§17.1 的包号编解码、§12.3 的部分包号空间状态、§17.2–17.3 的部分包头布局（包括版本协商和 Retry 的字段解析）、§18 的传输参数编解码与静态校验、§8.2 的单路径验证状态、§8/§9.3.1 的反放大额度记账、§5.1/§9.5 的对端连接 ID 池、§5.1.1/§19.16 的本端连接 ID 签发与退休状态、§19.1–19.20 的**核心帧线上格式**编解码、RFC 9001 §5.4 的报头掩码基础操作，以及 RFC 9002 §5 的 RTT 估计和 §6.2.1 的 PTO 时长计算。它们还没有组成 QUIC 连接；TLS、AEAD、Retry 完整性验证、版本协商处理、ACK 与丢包状态机、UDP 互通仍未完成。扩展帧及逐帧语义也尚未处理。最终以完整协议代码、测试和 `coverage.md` 为准。
+当前完成 RFC 9000 §16 的变长整数、§17.1 的包号编解码、§12.3 的部分包号空间状态、§17.2–17.3 的部分包头布局（包括版本协商和 Retry 的字段解析）、§18 的传输参数编解码与静态校验、§8.2 的单路径验证状态、§8/§9.3.1 的反放大额度记账、§5.1/§9.5 的对端连接 ID 池、§5.1.1/§19.16 的本端连接 ID 签发与退休状态、§19.1–19.20 的**核心帧线上格式**编解码、RFC 9001 §5.2–5.4 的 Initial 密钥、AES-GCM 载荷和 AES 报头保护基础操作，以及 RFC 9002 §5 的 RTT 估计和 §6.2.1 的 PTO 时长计算。它们还没有组成 QUIC 连接；TLS 1.3 握手、Handshake/1-RTT 密钥、Retry 完整性验证、版本协商处理、ACK 与丢包状态机、UDP 互通仍未完成。扩展帧及逐帧语义也尚未处理。最终以完整协议代码、测试和 `coverage.md` 为准。
 
 这份笔记按初学者能逐步手算的顺序编写：每节先说 RFC 规定什么，再解释为什么，最后回到当前 C++ 源码。笔记中的代码片段只摘取决定行为的语句；完整可编译代码以相应 `quic/*.hh`、`quic/*.cc` 和 `tests/quic_*.cc` 为准，避免复制一份会随实现变化而失真的源码。
 
@@ -40,6 +40,7 @@ flowchart LR
 | `PeerConnectionIds::on_new_id` / `select_for_path` / `retire_path` / `pending_retirements` | 输入来自已认证的包；路径键由连接层提供唯一的本地/远端地址对 | 跟踪对端签发的 CID、退休门槛、路径绑定、旧路径主动退休与资源限额；尚无发送帧、路由和生命周期接线 |
 | `LocalConnectionIds::issue` / `on_retire` / `lookup` | CID/token 由上层安全随机生成；退休帧来自已认证的包，须传入承载包的真实 DCID | 连续签发本端 CID，检查退休序号和包 DCID，移除活动 ID；尚无 UDP 分发路由和自动补发 |
 | `header_protection_sample` / `apply_header_mask` / `remove_header_mask` | 输入是**单个包**，`pn_offset` 相对包开头；mask 已生成 | 得 16 字节样本；掩码函数以 `bool` 表示能否完整修改 |
+| `derive_initial_keys` / `encrypt_initial_payload` / `decrypt_initial_payload` / `initial_header_mask` | 使用客户端首个 Initial 的 DCID；OpenSSL 3 提供密码原语；AEAD 的 AAD 是未遮盖的单包完整包头 | 派生双向 Initial 密钥，使用 AES-128-GCM 加解密及 AES-ECB 产生五字节报头掩码；仅覆盖 Initial 级别 |
 | `RttEstimator::observe` / `pto_ms` | 时间单位是毫秒；调用者先筛选合法 ACK 样本 | 更新路径 RTT；给出基础 PTO 时长或 `nullopt`，不负责定时器 |
 
 ## RFC 9000 §16：变长整数
@@ -273,7 +274,7 @@ Frame Type 说明**这是什么帧**；包类型又限制**这里能放什么帧
 
 ## RFC 9001 §5.4：报头保护的掩码操作
 
-`quic/header_protection.hh/.cc` 的 `header_protection_sample` 从包号字段起点往后跳四字节，取得 16 字节密文样本；长度不够返回空值。`apply_header_mask` 先从未保护的首字节读出包号长度，再只异或长报头最低四位或短报头最低五位及对应的 1–4 字节包号。`remove_header_mask` 顺序相反：先恢复首字节，再确定包号长度，最后恢复包号。任何字段不足都在写入前返回失败，因此不会留下半修改的报头。RFC 9001 附录 A.2 的客户端 Initial 报头与掩码是测试向量。
+`quic/header_protection.hh/.cc` 的 `header_protection_sample` 从包号字段起点往后跳四字节，取得 16 字节密文样本；长度不够返回空值。`apply_header_mask` 先从未保护的首字节读出包号长度，再只异或长报头最低四位或短报头最低五位及对应的 1–4 字节包号。`remove_header_mask` 顺序相反：先恢复首字节，再确定包号长度，最后恢复包号。任何字段不足都在写入前返回失败，因此不会留下半修改的报头。`initial_header_mask()` 已能从 Initial 密钥和样本生成 AES 掩码。RFC 9001 附录 A.2 的客户端 Initial 报头、密文样本与掩码是测试向量；计算过程见 [initial-packet-protection.md](initial-packet-protection.md)。
 
 报头保护隐藏的是一部分报头位与线上包号，不是整个包的加密。接收端至少还看得到长/短格式、长包头类型、版本、连接 ID 与 Length，所以前面的布局解析才有可能运行。保护用的五字节 mask 来自 `pn_offset + 4` 处的 16 字节密文样本；这里的“+4”始终固定，即使线上包号只有 1 字节。[RFC 9001 §5.4.2](https://www.rfc-editor.org/rfc/rfc9001.html#section-5.4.2)
 
@@ -297,7 +298,7 @@ for ( size_t i = 0; i < pn_length; ++i )
 
 异或同一个 mask 两次能恢复原值，但发送和接收不能简单调用同一个步骤顺序，因为接收端一开始不知道正确的包号长度。`remove_header_mask()` 在检查字段足够长后才修改报文；这一点防止畸形短包留下“首字节已改、包号还没改”的半修改状态。
 
-这两个函数接收**已经生成的五字节掩码**。从 TLS 派生 HP 密钥、AES/ChaCha 生成掩码、AEAD 加解密与认证都尚未实现；不能把这些函数当成安全的 QUIC 包保护。后续收到受保护包时，还必须在认证通过后才更新包号空间状态。
+这两个函数接收**已经生成的五字节掩码**。Initial 包的 AES 掩码和 AES-GCM 载荷认证现由 `initial_keys.cc` 提供，推导与向量见 [initial-packet-protection.md](initial-packet-protection.md)。TLS 产生的 Handshake/1-RTT 密钥、其它算法和整包收发仍未接线；后续收到受保护包时，必须在 AEAD 认证通过后才更新包号空间状态。
 
 ## RFC 9002 §5、§6.2.1：RTT 估计和 PTO 时长
 
@@ -332,7 +333,7 @@ PTO（Probe Timeout）是“等待确认过久时，什么时候尝试发探测�
 | 规范范围 | 已有的可调用代码 | 必须继续实现的内容 |
 | --- | --- | --- |
 | RFC 9000 | 变长整数、包号数值编解码与三空间的基础发送/接收记录、部分 v1 受保护包头、VN 构造与解析、Retry 字段解析、`0x00`–`0x1e` 核心帧线上格式与按包类型放置检查 | VN 接受逻辑、Retry 完整性验证及发送、扩展帧、ACK/发送历史与接收区间保留策略、方向/角色与流量控制等帧语义、连接与迁移状态、UDP 数据报组装 |
-| RFC 9001 | 已给定 mask 时的报头异或与样本位置 | TLS 1.3 集成、Initial/Handshake/1-RTT 密钥、mask 生成、AEAD 加解密与认证、密钥更新和丢弃 |
+| RFC 9001 | Initial 密钥派生、AES-128-GCM 载荷认证、AES 报头掩码与样本位置 | TLS 1.3 集成、Handshake/1-RTT 密钥、其它套件、整包接线、密钥更新和丢弃 |
 | RFC 9002 | RTT 估计、PTO 基础时长 | ACK 处理、发包记录、丢包判断、PTO 定时器与退避、拥塞控制及 ECN 验证 |
 
 这张表刻意区分“字节格式能解析”和“网络协议能工作”。例如 `AckFrame` 已能保存 `[4,5]` 和 `[8,10]`，但没有发包历史表就无法判断这些包是否真的发过，也无法释放 bytes-in-flight。`StreamFrame` 已能读出流 ID 和 FIN，但没有每流状态与流量控制，便不能把字节安全地交给应用。完整目标见 `requirements.md`；当前事实以源码、测试和 `coverage.md` 为准。
@@ -347,7 +348,7 @@ PTO（Probe Timeout）是“等待确认过久时，什么时候尝试发探测�
 | `packet_number` / `packet_number_space` | RFC 9000 §12.3、§17.1、附录 A.2/A.3；半窗口、三空间映射、乱序去重与 62 位上限 | 数值接口与基础收发状态已实现；自动记录清理、ACK 及密钥状态尚不存在 |
 | `packet_header` | RFC 9000 §17.2–17.3、RFC 9001 §5.4；v1 包型、CID、Length、样本可用性 | 已实现受保护包头布局、VN 线上格式和 Retry 字段解析；客户端接受规则与 Retry tag 验证尚未实现 |
 | `frame` | RFC 9000 §12.4–12.5、§19.1–19.20；长度、ACK gap、流终点、包类型限制和本地数值界限 | 核心帧线上字段与按包类型放置规则已实现；角色、方向、包号空间内容及连接语义未实现 |
-| `header_protection` | RFC 9001 §5.4；样本位置、首字节掩码宽度、收发操作顺序 | 已给定 mask 时的基础操作与对照规则一致；样本生成和完整包认证未实现 |
+| `header_protection` | RFC 9001 §5.4；样本位置、首字节掩码宽度、收发操作顺序 | 基础操作与 Initial AES 掩码生成已对照 RFC 向量；其它套件和整包认证接线未实现 |
 | `rtt_estimator` | RFC 9002 §5.3、§6.2.1 与勘误 7539；ACK Delay、更新顺序、PTO | 修正一处变动值更新顺序；ACK 处理与定时器未实现 |
 
 这里的“与对照规则一致”仅指表中列出的基础函数及检查过的输入，不代表完整 RFC 一致性或网络互通。独立审阅没有找到其他能复现的基础函数协议错误。还有一个重要接口约定：`PacketLayout::pn_offset` 是**整个数据报**的下标，而报头掩码函数用 `packet[0]` 当作当前包首字节。处理拼接包时，应先切出 `datagram.substr(packet_start, packet_end - packet_start)`，再将 `pn_offset` 换为 `pn_offset - packet_start`；直接传整个数据报会改错首字节。

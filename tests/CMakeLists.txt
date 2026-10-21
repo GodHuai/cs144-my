@@ -121,5 +121,11 @@ target_link_options(quic_local_connection_ids_sanitized PUBLIC ${SANITIZING_FLAG
 target_link_libraries(quic_local_connection_ids_sanitized quic_sanitized)
 add_dependencies(functionality_testing quic_local_connection_ids_sanitized)
 
+add_executable(quic_initial_keys_sanitized EXCLUDE_FROM_ALL quic_initial_keys.cc)
+target_compile_options(quic_initial_keys_sanitized PUBLIC ${SANITIZING_FLAGS})
+target_link_options(quic_initial_keys_sanitized PUBLIC ${SANITIZING_FLAGS})
+target_link_libraries(quic_initial_keys_sanitized quic_sanitized)
+add_dependencies(functionality_testing quic_initial_keys_sanitized)
+
 add_speed_test(byte_stream_speed_test)
 add_speed_test(reassembler_speed_test)
