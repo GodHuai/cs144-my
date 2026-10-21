@@ -1,6 +1,6 @@
 # QUIC v1 实现讲解（进行中）
 
-当前完成 RFC 9000 §16 的变长整数、§17.1 的包号编解码、§12.3 的部分包号空间状态、§17.2–17.3 的部分包头布局（包括版本协商和 Retry 的字段解析）、§18 的传输参数编解码与静态校验、§8.2 的单路径验证状态、§8/§9.3.1 的反放大额度记账、§5.1/§9.5 的对端连接 ID 池、§5.1.1/§19.16 的本端连接 ID 签发与退休状态、§19.1–19.20 的**核心帧线上格式**编解码、RFC 9001 §5.2–5.4 的 Initial 密钥、AES-GCM 载荷和 AES 报头保护基础操作，以及 RFC 9002 §5 的 RTT 估计和 §6.2.1 的 PTO 时长计算。它们还没有组成 QUIC 连接；TLS 1.3 握手、Handshake/1-RTT 密钥、Retry 完整性验证、版本协商处理、ACK 与丢包状态机、UDP 互通仍未完成。扩展帧及逐帧语义也尚未处理。最终以完整协议代码、测试和 `coverage.md` 为准。
+当前完成 RFC 9000 §16 的变长整数、§17.1 的包号编解码、§12.3 的部分包号空间状态、§17.2–17.3 的部分包头布局（包括版本协商和 Retry 的字段解析）、§18 的传输参数编解码与静态校验、§8.2 的单路径验证状态、§8/§9.3.1 的反放大额度记账、§5.1/§9.5 的对端连接 ID 池、§5.1.1/§19.16 的本端连接 ID 签发与退休状态、§19.1–19.20 的**核心帧线上格式**编解码、RFC 9001 §5.2–5.4 的 Initial 密钥、AES-GCM 载荷和 AES 报头保护基础操作、§5.8 的 Retry 完整性标签，以及 RFC 9002 §5 的 RTT 估计和 §6.2.1 的 PTO 时长计算。它们还没有组成 QUIC 连接；TLS 1.3 握手、Handshake/1-RTT 密钥、Retry 状态机、版本协商处理、ACK 与丢包状态机、UDP 互通仍未完成。扩展帧及逐帧语义也尚未处理。最终以完整协议代码、测试和 `coverage.md` 为准。
 
 这份笔记按初学者能逐步手算的顺序编写：每节先说 RFC 规定什么，再解释为什么，最后回到当前 C++ 源码。笔记中的代码片段只摘取决定行为的语句；完整可编译代码以相应 `quic/*.hh`、`quic/*.cc` 和 `tests/quic_*.cc` 为准，避免复制一份会随实现变化而失真的源码。
 
@@ -41,6 +41,7 @@ flowchart LR
 | `LocalConnectionIds::issue` / `on_retire` / `lookup` | CID/token 由上层安全随机生成；退休帧来自已认证的包，须传入承载包的真实 DCID | 连续签发本端 CID，检查退休序号和包 DCID，移除活动 ID；尚无 UDP 分发路由和自动补发 |
 | `header_protection_sample` / `apply_header_mask` / `remove_header_mask` | 输入是**单个包**，`pn_offset` 相对包开头；mask 已生成 | 得 16 字节样本；掩码函数以 `bool` 表示能否完整修改 |
 | `derive_initial_keys` / `encrypt_initial_payload` / `decrypt_initial_payload` / `initial_header_mask` | 使用客户端首个 Initial 的 DCID；OpenSSL 3 提供密码原语；AEAD 的 AAD 是未遮盖的单包完整包头 | 派生双向 Initial 密钥，使用 AES-128-GCM 加解密及 AES-ECB 产生五字节报头掩码；仅覆盖 Initial 级别 |
+| `compute_retry_integrity_tag` / `verify_retry_integrity` | 输入客户端最初的 DCID 和 v1 Retry 原始字节；在改变连接状态前调用 | 按伪包算固定 key/nonce 的 AES-GCM 标签并做固定时间验证；尚未接入 Retry 状态机 |
 | `RttEstimator::observe` / `pto_ms` | 时间单位是毫秒；调用者先筛选合法 ACK 样本 | 更新路径 RTT；给出基础 PTO 时长或 `nullopt`，不负责定时器 |
 
 ## RFC 9000 §16：变长整数
@@ -174,7 +175,7 @@ layout.packet_end = cursor + static_cast<size_t>( *length );
 
 Retry 的首字节高四位为 `1111`，随后是 v1 版本号、两个有长度的连接 ID、不带长度字段的 Token、最后固定 16 字节的 Retry Integrity Tag。解析时从报文尾部倒数 16 字节划出 tag，中间剩余的都是 Token；Token 为空的包应被客户端丢弃。与受保护的 Initial 不同，Retry 没有包号、Length 或经过报头保护的字段，也占满一个数据报。[RFC 9000 §17.2.5](https://www.rfc-editor.org/rfc/rfc9000.html#section-17.2.5)
 
-`parse_retry_packet()` 只检查这些字节的布局：v1 版本、CID 不超过 20 字节、Token 非空且尾部有 16 字节 tag。**返回非空并不表示这个 Retry 可信。**攻击者可以任意填入 16 字节 tag，让字段解析照样成功。客户端必须用自己最初发送的目标连接 ID，按照 RFC 9001 §5.8 计算并验证 Retry Integrity Tag；验证失败必须丢弃。在此之前，不得把 Token、服务器连接 ID 或其他字段写入连接状态。当前尚未实现这个加密验证，也没有生成合法 Retry tag 的构造函数。[RFC 9001 §5.8](https://www.rfc-editor.org/rfc/rfc9001.html#section-5.8)
+`parse_retry_packet()` 只检查这些字节的布局：v1 版本、CID 不超过 20 字节、Token 非空且尾部有 16 字节 tag。**返回非空并不表示这个 Retry 可信。**攻击者可以任意填入 16 字节 tag，让字段解析照样成功。客户端必须用自己最初发送的目标连接 ID 调用 `verify_retry_integrity()`；失败必须丢弃。在此之前，不得把 Token、服务器连接 ID 或其他字段写入连接状态。`compute_retry_integrity_tag()` 也可供服务器在构造 Retry 时使用。两者的伪包、固定密钥和测试向量详见 [retry-integrity.md](retry-integrity.md)；客户端 Retry 状态机尚未接线。[RFC 9001 §5.8](https://www.rfc-editor.org/rfc/rfc9001.html#section-5.8)
 
 可以自己检验是否理解：为何 VN 能容纳 21 字节连接 ID，而 Retry 不能？因为 VN 的格式与版本无关，而这个 Retry 明确带有 v1 版本字段。为何把 Retry 尾部 16 字节切下来还不算验证？因为字节数正确不证明 tag 是用规范密钥、Nonce 和原始目标连接 ID 算出来的。
 
@@ -346,7 +347,7 @@ PTO（Probe Timeout）是“等待确认过久时，什么时候尝试发探测�
 | --- | --- | --- |
 | `varint` | RFC 9000 §16、附录 A.1；长度边界、非最短编码与截断 | 现有实现和测试中的行为与对照规则一致 |
 | `packet_number` / `packet_number_space` | RFC 9000 §12.3、§17.1、附录 A.2/A.3；半窗口、三空间映射、乱序去重与 62 位上限 | 数值接口与基础收发状态已实现；自动记录清理、ACK 及密钥状态尚不存在 |
-| `packet_header` | RFC 9000 §17.2–17.3、RFC 9001 §5.4；v1 包型、CID、Length、样本可用性 | 已实现受保护包头布局、VN 线上格式和 Retry 字段解析；客户端接受规则与 Retry tag 验证尚未实现 |
+| `packet_header` / `retry_integrity` | RFC 9000 §17.2–17.3、RFC 9001 §5.4、§5.8；v1 包型、CID、Length、样本与 Retry 标签 | 已实现受保护包头布局、VN 线上格式、Retry 字段解析与标签验证原语；客户端接受规则和 Retry 状态机尚未实现 |
 | `frame` | RFC 9000 §12.4–12.5、§19.1–19.20；长度、ACK gap、流终点、包类型限制和本地数值界限 | 核心帧线上字段与按包类型放置规则已实现；角色、方向、包号空间内容及连接语义未实现 |
 | `header_protection` | RFC 9001 §5.4；样本位置、首字节掩码宽度、收发操作顺序 | 基础操作与 Initial AES 掩码生成已对照 RFC 向量；其它套件和整包认证接线未实现 |
 | `rtt_estimator` | RFC 9002 §5.3、§6.2.1 与勘误 7539；ACK Delay、更新顺序、PTO | 修正一处变动值更新顺序；ACK 处理与定时器未实现 |

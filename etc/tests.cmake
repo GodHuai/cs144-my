@@ -63,6 +63,7 @@ ttest(quic_anti_amplification)
 ttest(quic_peer_connection_ids)
 ttest(quic_local_connection_ids)
 ttest(quic_initial_keys)
+ttest(quic_retry_integrity)
 
 ttest(net_interface)
 

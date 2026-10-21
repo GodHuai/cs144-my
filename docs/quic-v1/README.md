@@ -12,6 +12,7 @@
    [connection-ids.md](connection-ids.md) 解释迁移时使用、退休和替换连接 ID。
    [local-connection-ids.md](local-connection-ids.md) 解释本端签发连接 ID、处理对端退休帧和路由入口。
    [initial-packet-protection.md](initial-packet-protection.md) 手算 Initial 密钥、AES-GCM 载荷和报头掩码。
+   [retry-integrity.md](retry-integrity.md) 解释 Retry 伪包和接收前的完整性验证。
 3. [coverage.md](coverage.md)：查某条规范现在有代码、有测试，还是尚未开始。
 4. [design.md](design.md) 与 [tasks.md](tasks.md)：完整连接的目标架构和后续工作顺序；它们是计划，不是当前实现证据。
 5. `docs/superpowers/specs/`、`docs/superpowers/plans/`：每一轮小功能的设计与测试记录。
@@ -31,6 +32,7 @@
 | 怎样签发供对端使用的连接 ID，并处理其退休请求？ | RFC 9000 §5.1.1、§19.16 | [local_connection_ids.hh](../../quic/local_connection_ids.hh)、[local_connection_ids.cc](../../quic/local_connection_ids.cc) | [quic_local_connection_ids.cc](../../tests/quic_local_connection_ids.cc) |
 | 报头保护为什么先取样、再恢复包号长度？ | RFC 9001 §5.4 | [header_protection.hh](../../quic/header_protection.hh)、[header_protection.cc](../../quic/header_protection.cc) | [quic_packet_primitives.cc](../../tests/quic_packet_primitives.cc) |
 | Initial 包怎样派生密钥并保护载荷？ | RFC 9001 §5.1–5.4 | [initial_keys.hh](../../quic/initial_keys.hh)、[initial_keys.cc](../../quic/initial_keys.cc) | [quic_initial_keys.cc](../../tests/quic_initial_keys.cc) |
+| 怎样验证 Retry 确实对应最初的 Initial？ | RFC 9001 §5.8 | [retry_integrity.hh](../../quic/retry_integrity.hh)、[retry_integrity.cc](../../quic/retry_integrity.cc) | [quic_retry_integrity.cc](../../tests/quic_retry_integrity.cc) |
 | 收到 ACK 后如何更新 RTT 和 PTO？ | RFC 9002 §5–6 | [rtt_estimator.hh](../../quic/rtt_estimator.hh)、[rtt_estimator.cc](../../quic/rtt_estimator.cc) | [quic_packet_primitives.cc](../../tests/quic_packet_primitives.cc) |
 
 ## 一句话检查当前边界
