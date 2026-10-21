@@ -1,6 +1,6 @@
 # QUIC v1 实现讲解（进行中）
 
-当前完成 RFC 9000 §16 的变长整数、§17.1 的包号编解码、§12.3 的部分包号空间状态、§17.2–17.3 的部分包头布局（包括版本协商和 Retry 的字段解析）、§18 的传输参数编解码与静态校验、§8.2 的单路径验证状态、§19.1–19.20 的**核心帧线上格式**编解码、RFC 9001 §5.4 的报头掩码基础操作，以及 RFC 9002 §5 的 RTT 估计和 §6.2.1 的 PTO 时长计算。它们还没有组成 QUIC 连接；TLS、AEAD、Retry 完整性验证、版本协商处理、ACK 与丢包状态机、UDP 互通仍未完成。扩展帧及逐帧语义也尚未处理。最终以完整协议代码、测试和 `coverage.md` 为准。
+当前完成 RFC 9000 §16 的变长整数、§17.1 的包号编解码、§12.3 的部分包号空间状态、§17.2–17.3 的部分包头布局（包括版本协商和 Retry 的字段解析）、§18 的传输参数编解码与静态校验、§8.2 的单路径验证状态、§8/§9.3.1 的反放大额度记账、§19.1–19.20 的**核心帧线上格式**编解码、RFC 9001 §5.4 的报头掩码基础操作，以及 RFC 9002 §5 的 RTT 估计和 §6.2.1 的 PTO 时长计算。它们还没有组成 QUIC 连接；TLS、AEAD、Retry 完整性验证、版本协商处理、ACK 与丢包状态机、UDP 互通仍未完成。扩展帧及逐帧语义也尚未处理。最终以完整协议代码、测试和 `coverage.md` 为准。
 
 这份笔记按初学者能逐步手算的顺序编写：每节先说 RFC 规定什么，再解释为什么，最后回到当前 C++ 源码。笔记中的代码片段只摘取决定行为的语句；完整可编译代码以相应 `quic/*.hh`、`quic/*.cc` 和 `tests/quic_*.cc` 为准，避免复制一份会随实现变化而失真的源码。
 
@@ -36,6 +36,7 @@ flowchart LR
 | `decode_frames` / `encode_frame` | 解码输入应来自已认证的包载荷 | 得帧列表或单帧字节；截断/不支持得 `nullopt`，非法编码请求抛异常 |
 | `decode_transport_parameters` / `encode_transport_parameters` / `validate_transport_parameters` | TLS 扩展原始字节；角色验证须提供实际 Initial/Retry 包头里的 CID | 解码拒绝重复/非法值，编码拒绝非法本地值，角色验证返回 `bool`；尚未接入 TLS |
 | `PathValidation::start` / `record_sent_challenge` / `on_response` / `expire` | 每条候选路径一个实例；挑战值由安全随机源生成；仅记录实际发送的探测与认证成功的回应 | 返回验证阶段，区分地址可达与 1200 字节 MTU；未接入 UDP 或迁移决策 |
+| `AntiAmplificationBudget::record_received` / `record_sent` / `validate_address` | 每个对端地址一个实例；构造时标记发起者或回应者；输入为能唯一归属连接的整个 UDP 载荷字节数 | 回应未验证地址时最多发送接收量的三倍；客户端 Initial 和主动迁移不受该规则限制；尚无 UDP 归属和发送失败回滚接线 |
 | `header_protection_sample` / `apply_header_mask` / `remove_header_mask` | 输入是**单个包**，`pn_offset` 相对包开头；mask 已生成 | 得 16 字节样本；掩码函数以 `bool` 表示能否完整修改 |
 | `RttEstimator::observe` / `pto_ms` | 时间单位是毫秒；调用者先筛选合法 ACK 样本 | 更新路径 RTT；给出基础 PTO 时长或 `nullopt`，不负责定时器 |
 
