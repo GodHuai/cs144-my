@@ -133,5 +133,11 @@ target_link_options(quic_retry_integrity_sanitized PUBLIC ${SANITIZING_FLAGS})
 target_link_libraries(quic_retry_integrity_sanitized quic_sanitized)
 add_dependencies(functionality_testing quic_retry_integrity_sanitized)
 
+add_executable(quic_initial_packet_sanitized EXCLUDE_FROM_ALL quic_initial_packet.cc)
+target_compile_options(quic_initial_packet_sanitized PUBLIC ${SANITIZING_FLAGS})
+target_link_options(quic_initial_packet_sanitized PUBLIC ${SANITIZING_FLAGS})
+target_link_libraries(quic_initial_packet_sanitized quic_sanitized)
+add_dependencies(functionality_testing quic_initial_packet_sanitized)
+
 add_speed_test(byte_stream_speed_test)
 add_speed_test(reassembler_speed_test)

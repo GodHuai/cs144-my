@@ -11,9 +11,9 @@
 | RFC 9000 §9–11、§5.1 | 迁移、路径、连接 ID 与终止 | 9–10 | 部分实现：`quic/peer_connection_ids.*` 管对端签发的 ID 与路径绑定；`quic/local_connection_ids.*` 管本端签发的 ID、退休帧检查及活动 ID 查找；§8 的额度和验证状态基础见上一行。实际迁移、地址切换、反放大与路径状态接线、UDP 路由、随机 CID/token 生成及新路径拥塞状态仍待完成。详见 `connection-ids.md`、`local-connection-ids.md` |
 | RFC 9000 §12–13 | 包、帧、ACK、可靠性与 ECN | 2、6–7 | 部分实现：包号编码、§12.3 三空间映射/发送分配/认证后接收去重、受保护包边界定位、核心帧 `0x00`–`0x1e` 线上格式编解码及 §12.4 表 3 包类型放置校验见 `quic/packet_number.*`、`quic/packet_number_space.*`、`quic/packet_header.*`、`quic/frame.*`；自动接收记录保留策略、角色/方向规则、ACK 处理与可靠性待完成 |
 | RFC 9000 §14–16 | 数据报大小、PMTU、编码 | 2、10 | 部分实现：§16 变长整数见 `quic/varint.hh`、`quic/varint.cc`；`tests/quic_varint.cc` 覆盖边界和附录 A.1 向量。其余待完成 |
-| RFC 9000 §17–21 | v1 包格式、基础帧、错误与安全 | 2–10 | 部分实现：§17.1 包号编解码；§17.2–17.3 Initial、0-RTT、Handshake、1-RTT 的受保护包边界与未保护包头构造；§17.2.1 VN 线上构造/解析，§17.2.5 Retry 字段解析；§19.1–19.20 的核心帧线上格式。Retry 标签验证原语见 RFC 9001 §5.8；扩展帧、VN 客户端处理、Retry 客户端接受状态机、整包保护接线及帧/连接语义与错误处理待完成 |
+| RFC 9000 §17–21 | v1 包格式、基础帧、错误与安全 | 2–10 | 部分实现：§17.1 包号编解码；§17.2–17.3 Initial、0-RTT、Handshake、1-RTT 的受保护包边界与未保护包头构造，其中 Initial 已有单包封装/认证解封原语；§17.2.1 VN 线上构造/解析，§17.2.5 Retry 字段解析；§19.1–19.20 的核心帧线上格式。Retry 标签验证原语见 RFC 9001 §5.8；扩展帧、VN 客户端处理、Retry 客户端接受状态机、其余级别整包保护及帧/连接语义与错误处理待完成 |
 | RFC 9001 §2–4 | TLS 与加密级别、握手 | 3、8 | 计划 |
-| RFC 9001 §5–6 | 包保护与密钥更新 | 3、10 | 部分实现：§5.2 的 v1 Initial 密钥派生、§5.3 的 Initial AES-128-GCM 载荷保护、§5.4 的 AES 报头掩码、§5.8 的 v1 Retry 完整性标签，均用附录 A 向量校验；仍缺整包与 Retry 状态机接线、TLS 提供的 Handshake/1-RTT 密钥、其它套件、密钥更新与使用上限处置。详见 `initial-packet-protection.md`、`retry-integrity.md` |
+| RFC 9001 §5–6 | 包保护与密钥更新 | 3、10 | 部分实现：§5.2 的 v1 Initial 密钥派生、§5.3 的 Initial AES-128-GCM 载荷保护、§5.4 的 AES 报头掩码与单个 Initial 整包封装/认证解封、§5.8 的 v1 Retry 完整性标签，均用附录 A 向量校验；仍缺连接/UDP 和 Retry 状态机接线、TLS 提供的 Handshake/1-RTT 密钥、其它套件、密钥更新与使用上限处置。详见 `initial-packet-protection.md`、`initial-packet.md`、`retry-integrity.md` |
 | RFC 9001 §7–9 | 0-RTT、参数与安全 | 3、8 | 计划 |
 | RFC 9002 §3–6 | RTT、ACK、丢包与 PTO | 6 | 部分实现：§5 的 RTT 估计与 §6.2.1 的 PTO 时长计算；ACK 样本筛选、丢包判定、PTO 定时器与退避待完成 |
 | RFC 9002 §7–8 | 拥塞、ECN 与安全 | 7 | 计划 |
