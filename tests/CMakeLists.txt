@@ -109,5 +109,11 @@ target_link_options(quic_anti_amplification_sanitized PUBLIC ${SANITIZING_FLAGS}
 target_link_libraries(quic_anti_amplification_sanitized quic_sanitized)
 add_dependencies(functionality_testing quic_anti_amplification_sanitized)
 
+add_executable(quic_peer_connection_ids_sanitized EXCLUDE_FROM_ALL quic_peer_connection_ids.cc)
+target_compile_options(quic_peer_connection_ids_sanitized PUBLIC ${SANITIZING_FLAGS})
+target_link_options(quic_peer_connection_ids_sanitized PUBLIC ${SANITIZING_FLAGS})
+target_link_libraries(quic_peer_connection_ids_sanitized quic_sanitized)
+add_dependencies(functionality_testing quic_peer_connection_ids_sanitized)
+
 add_speed_test(byte_stream_speed_test)
 add_speed_test(reassembler_speed_test)

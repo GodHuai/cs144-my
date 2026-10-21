@@ -60,6 +60,7 @@ ttest(quic_packet_header)
 ttest(quic_transport_parameters)
 ttest(quic_path_validation)
 ttest(quic_anti_amplification)
+ttest(quic_peer_connection_ids)
 
 ttest(net_interface)
 
