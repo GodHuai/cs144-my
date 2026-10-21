@@ -57,6 +57,7 @@ ttest(quic_varint)
 ttest(quic_packet_primitives)
 ttest(quic_frames)
 ttest(quic_packet_header)
+ttest(quic_transport_parameters)
 
 ttest(net_interface)
 

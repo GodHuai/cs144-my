@@ -91,5 +91,11 @@ target_link_options(quic_packet_header_sanitized PUBLIC ${SANITIZING_FLAGS})
 target_link_libraries(quic_packet_header_sanitized quic_sanitized)
 add_dependencies(functionality_testing quic_packet_header_sanitized)
 
+add_executable(quic_transport_parameters_sanitized EXCLUDE_FROM_ALL quic_transport_parameters.cc)
+target_compile_options(quic_transport_parameters_sanitized PUBLIC ${SANITIZING_FLAGS})
+target_link_options(quic_transport_parameters_sanitized PUBLIC ${SANITIZING_FLAGS})
+target_link_libraries(quic_transport_parameters_sanitized quic_sanitized)
+add_dependencies(functionality_testing quic_transport_parameters_sanitized)
+
 add_speed_test(byte_stream_speed_test)
 add_speed_test(reassembler_speed_test)

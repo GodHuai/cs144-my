@@ -1,6 +1,6 @@
 # QUIC v1 实现讲解（进行中）
 
-当前完成 RFC 9000 §16 的变长整数、§17.1 的包号编解码、§12.3 的部分包号空间状态、§17.2–17.3 的部分包头布局（包括版本协商和 Retry 的字段解析）、§19.1–19.20 的**核心帧线上格式**编解码、RFC 9001 §5.4 的报头掩码基础操作，以及 RFC 9002 §5 的 RTT 估计和 §6.2.1 的 PTO 时长计算。它们还没有组成 QUIC 连接；TLS、AEAD、Retry 完整性验证、版本协商处理、ACK 与丢包状态机、UDP 互通仍未完成。扩展帧及逐帧语义也尚未处理。最终以完整协议代码、测试和 `coverage.md` 为准。
+当前完成 RFC 9000 §16 的变长整数、§17.1 的包号编解码、§12.3 的部分包号空间状态、§17.2–17.3 的部分包头布局（包括版本协商和 Retry 的字段解析）、§18 的传输参数编解码与静态校验、§19.1–19.20 的**核心帧线上格式**编解码、RFC 9001 §5.4 的报头掩码基础操作，以及 RFC 9002 §5 的 RTT 估计和 §6.2.1 的 PTO 时长计算。它们还没有组成 QUIC 连接；TLS、AEAD、Retry 完整性验证、版本协商处理、ACK 与丢包状态机、UDP 互通仍未完成。扩展帧及逐帧语义也尚未处理。最终以完整协议代码、测试和 `coverage.md` 为准。
 
 这份笔记按初学者能逐步手算的顺序编写：每节先说 RFC 规定什么，再解释为什么，最后回到当前 C++ 源码。笔记中的代码片段只摘取决定行为的语句；完整可编译代码以相应 `quic/*.hh`、`quic/*.cc` 和 `tests/quic_*.cc` 为准，避免复制一份会随实现变化而失真的源码。
 
@@ -34,10 +34,13 @@ flowchart LR
 | `parse_protected_packet` | 输入是数据报，`offset` 是当前包起点；短包头需已知 DCID 长度 | 得 `pn_offset`、`packet_end` 等布局；不支持或截断时得 `nullopt` |
 | `build_long_header` / `build_short_header` | 密文长度包括 AEAD tag；包号长度 1–4 | 得未保护包头；不合法构造请求抛异常 |
 | `decode_frames` / `encode_frame` | 解码输入应来自已认证的包载荷 | 得帧列表或单帧字节；截断/不支持得 `nullopt`，非法编码请求抛异常 |
+| `decode_transport_parameters` / `encode_transport_parameters` / `validate_transport_parameters` | TLS 扩展原始字节；角色验证须提供实际 Initial/Retry 包头里的 CID | 解码拒绝重复/非法值，编码拒绝非法本地值，角色验证返回 `bool`；尚未接入 TLS |
 | `header_protection_sample` / `apply_header_mask` / `remove_header_mask` | 输入是**单个包**，`pn_offset` 相对包开头；mask 已生成 | 得 16 字节样本；掩码函数以 `bool` 表示能否完整修改 |
 | `RttEstimator::observe` / `pto_ms` | 时间单位是毫秒；调用者先筛选合法 ACK 样本 | 更新路径 RTT；给出基础 PTO 时长或 `nullopt`，不负责定时器 |
 
 ## RFC 9000 §16：变长整数
+
+传输参数也用这里的 varint 表示 ID、长度和整数值；读完本节后可到 [传输参数专题](transport-parameters.md) 手算一段 TLS 扩展字节。
 
 QUIC 的变长整数使用首字节最高两位表示总长度：`00` 为 1 字节，`01` 为 2 字节，`10` 为 4 字节，`11` 为 8 字节。剩余位以网络字节序表示非负整数，最大值为 `2^62 − 1`。[RFC 9000 §16](https://www.rfc-editor.org/rfc/rfc9000.html#section-16)
 
