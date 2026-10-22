@@ -1,6 +1,6 @@
 # 握手丢包恢复与 RTT 接线
 
-`quic/packet_recovery.*` 在已有 ACK 连接上增加发送时间、RTT 样本、包号/时间阈值、重发队列和 PTO。当前覆盖握手 CRYPTO、HANDSHAKE_DONE 和 PING；已由后续 [NewReno 基础控制](congestion-control.md) 增加物理 bytes-in-flight 与发送窗口；仍没有 pacing、持续拥塞、ECN 验证或可靠应用流，因此仍不是完整 RFC 9002 传输。
+`quic/packet_recovery.*` 在已有 ACK 连接上增加发送时间、RTT 样本、包号/时间阈值、重发队列和 PTO。当前覆盖握手 CRYPTO、HANDSHAKE_DONE 和 PING；已由后续 [NewReno 基础控制](congestion-control.md) 增加物理 bytes-in-flight 与发送窗口；仍没有持续拥塞、ECN 验证或可靠应用流，因此仍不是完整 RFC 9002 传输。
 
 ## 事件循环接口
 
@@ -33,7 +33,7 @@ PTO 基于已有估计器，初始为 999ms，Initial/Handshake 不加 max_ack_d
 
 ## 资源边界和剩余工作
 
-每空间最多 4096 个活动发送记录、4096 个最近的丢失/被替代/ACK-only 记录，最多 4096 个等待重新发送的逻辑帧；同一身份只排队一次。活动容量满时保留原有发送背压，包括探测包，直至 ACK 或声明丢失释放容量；无限丢包/永久不确认不保证进展。退避和期限使用饱和算术。CRYPTO 发送缓冲按 ACK 回收、流数据恢复、持续拥塞/pacing/ECN 和外部互通仍待完成；基础拥塞约束现已接入。
+每空间最多 4096 个活动发送记录、4096 个最近的丢失/被替代/ACK-only 记录，最多 4096 个等待重新发送的逻辑帧；同一身份只排队一次。活动容量满时保留原有发送背压，包括探测包，直至 ACK 或声明丢失释放容量；无限丢包/永久不确认不保证进展。退避和期限使用饱和算术。CRYPTO 发送缓冲按 ACK 回收、流数据恢复、持续拥塞/ECN 和外部互通仍待完成；基础拥塞约束现已接入。
 
 测试使用注入时钟验证初始/退避期限、时间与包号阈值、ACK-only 最大包 RTT、ACK Delay 单位、零间隔样本、迟到 ACK、重复超时回调、反放大暂停和密钥退役；连接故障注入分别丢弃客户端 Initial、服务端 Initial、服务端 Handshake 分片、客户端 Finished、HANDSHAKE_DONE 及其 ACK；另连续丢失三份 Initial/Handshake/Finished/HANDSHAKE_DONE，共十种场景，要求双方最终确认。真实双栈 UDP 回归继续保留。
 
@@ -44,4 +44,6 @@ PTO 基于已有估计器，初始为 999ms，Initial/Handshake 不加 max_ack_d
 
 代码基准 `7abc5c7` 的验证记录（历史里程碑）：QUIC CTest **21/21**（21.00 秒）；全量 **52/59**（107.85 秒）。既有超时：wrapping_integers_roundtrip、wrapping_integers_extra、recv_transmit、recv_reorder_more、send_transmit；net_interface、router 缺少可执行文件。独立审查的三项计时器问题均通过失败复现与修复后验证，未留下 Minor。当前只保留隔离分支的本地提交。
 
-后续已实现基础 NewReno 的物理在途字节与窗口，最新验证为 QUIC 22/22、全量 53/60，详见 [congestion-control.md](congestion-control.md)。
+后续已实现基础 NewReno 的物理在途字节与窗口，该阶段验证为 QUIC 22/22、全量 53/60，详见 [congestion-control.md](congestion-control.md)。
+
+后续已接入有界令牌桶 pacing：速率随窗口与 RTT 调整，发送唤醒与恢复期限合并，纯 ACK/PTO 探测保留例外。当前实现与验证见 [pacing.md](pacing.md)。

@@ -8,7 +8,7 @@
 
 客户端构造后即可 `poll_transmit()` 取得 Initial（最终 UDP payload 恰为 1200 字节，包含包头和 AEAD 标签）；服务端在通过认证、数据报大小及帧检查的首个 Initial 中取得实际 SCID/DCID，随后创建 TLS。外部 UDP 接收器将完整 `UdpDatagram` 交给 `receive()`；类会检查来源地址和 DCID，再逐个处理合并包。不同对端地址的数据报直接丢弃，本轮不处理迁移。
 
-`poll_transmit()` 在精确线上大小通过拥塞及反放大检查后才分配包号，每次交付一个含目标地址、payload 和 ECN 的数据报，并记入发送额度和物理在途字节、推进新 CRYPTO offset。阻塞时不消费 TLS/恢复队列；纯 ACK 可回退，PTO 探测可越过拥塞窗口但受反放大约束。**这一步是发送交接**：若随后 `UdpSocket::send()` 返回 EAGAIN，外部事件循环必须保存并重试同一个数据报，不能把再次 poll 的输出当作其替代品。网络发送错误由外部循环处置。
+`poll_transmit()` 在精确线上大小通过拥塞、反放大及 pacing 检查后才分配包号，每次交付一个含目标地址、payload 和 ECN 的数据报，并记入发送额度和物理在途字节、推进新 CRYPTO offset。阻塞时不消费 TLS/恢复队列；纯 ACK 可回退，PTO 探测可越过拥塞窗口及 pacing 但受反放大约束。**这一步是发送交接**：若随后 `UdpSocket::send()` 返回 EAGAIN，外部事件循环必须保存并重试同一个数据报，不能把再次 poll 的输出当作其替代品。网络发送错误由外部循环处置。
 
 ## 认证、参数绑定与缓冲
 
@@ -28,7 +28,7 @@
 
 ## 当前支持范围
 
-支持握手 CRYPTO、PADDING、PING、HANDSHAKE_DONE 和对端关闭。ACK 已接入生成与发送记录更新，详见 [acknowledgments.md](acknowledgments.md)；RTT、握手帧重传和 PTO 现已接入，见 [loss-recovery.md](loss-recovery.md)；单路径 NewReno 物理字节/窗口见 [congestion-control.md](congestion-control.md)，持续拥塞、pacing 和 ECN 验证仍缺失。`send_ping()` 最多保留一个待发 PING。
+支持握手 CRYPTO、PADDING、PING、HANDSHAKE_DONE 和对端关闭。ACK 已接入生成与发送记录更新，详见 [acknowledgments.md](acknowledgments.md)；RTT、握手帧重传和 PTO 现已接入，见 [loss-recovery.md](loss-recovery.md)；单路径 NewReno 物理字节/窗口见 [congestion-control.md](congestion-control.md)，持续拥塞和 ECN 验证仍缺失。`send_ping()` 最多保留一个待发 PING。
 
 STREAM、流量控制、连接 ID 生命周期、路径控制及其它未实现语义不会被交给应用，认证后遇到它们以本地 INTERNAL_ERROR (`0x01`) 结束；这不表示它们本身都是对端协议违规。后握手 CRYPTO 和密钥更新也尚不支持。该类不接受 Retry、0-RTT、版本协商或 TLS 会话恢复，不提供监听器、动态多连接分发、空闲超时及外部互通保证。
 
@@ -45,3 +45,5 @@ ctest --test-dir build --output-on-failure --timeout 30 -j2
 独立审查发现两项重要接线问题：Initial 认证后保留位错误被旧 optional 接口隐去、Initial 将明文而非最终数据报填充到 1200 字节。两项均先新增回归复现，再修复；边界测试包括损坏认证标签、错误状态保持，以及仅接受 <=1200 字节数据报的 8/20 字节 CID 双端握手。该连接初始里程碑修复后 QUIC 专项 19/19 通过（含编译 fixture，20.21 秒）；修复后全量 50/57 通过（100.79 秒），与上一轮相同的五个超时为 `wrapping_integers_roundtrip`、`wrapping_integers_extra`、`recv_transmit`、`recv_reorder_more`、`send_transmit`；`net_interface` 和 `router` 因缺少可执行文件未运行。日志在忽略的 `build/quic-connection-full-ctest.log`。普通 `quic_debug` 构建、格式及空白检查通过；不宣称全量套件通过。
 
 当前代码基准 `7abc5c7` 已加入超时 API 和十种握手丢包场景；最近 QUIC 21/21、全量 52/59 的记录与事件循环约定见 [loss-recovery.md](loss-recovery.md)。上述 19/19、50/57 为历史结果。
+
+后续已接入有界令牌桶 pacing：速率随窗口与 RTT 调整，发送唤醒与恢复期限合并，纯 ACK/PTO 探测保留例外。当前实现与验证见 [pacing.md](pacing.md)。

@@ -305,6 +305,62 @@ void congestion_scheduling()
            "ACK did not release physical flight" );
   require( client.poll_transmit().has_value(), "ACK did not reopen fresh sending" );
 }
+void pacing_scheduling()
+{
+  uint64_t now = 1000;
+  auto cc = config( false ), sc = config( true );
+  cc.clock_us = sc.clock_us = [&now] { return now; };
+  HandshakeConnection client { cc, server_address }, server { sc, client_address };
+  for ( unsigned round = 0; round < 8; ++round ) {
+    now += 1000;
+    transfer( client, server, client_address );
+    now += 1000;
+    transfer( server, client, server_address );
+  }
+  require( client.state() == ConnectionState::Confirmed, "pacing handshake" );
+  // Consume burst credit, then ACK it without advancing the injected clock.
+  // Pacing credit must remain independent of congestion credit.
+  for ( unsigned i = 0; i < 100; ++i ) {
+    client.send_ping();
+    const auto out = client.poll_transmit();
+    require( out.has_value(), "pacing warmup burst" );
+    deliver( server, *out, client_address );
+  }
+  transfer( server, client, server_address );
+  require( client.congestion_stats().bytes_in_flight == 0, "pacing warmup ACK" );
+  std::vector<UdpDatagram> held;
+  uint64_t bytes = 0;
+  for ( unsigned i = 0; i < 1000; ++i ) {
+    require( client.send_ping(), "pacing PING queue" );
+    const auto out = client.poll_transmit();
+    if ( !out )
+      break;
+    bytes += out->payload.size();
+    held.push_back( *out );
+  }
+  require( !held.empty() && client.congestion_stats().window - bytes >= 1200,
+           "pacer did not stop output before congestion window" );
+  const auto wake = client.next_timeout_us();
+  require( wake && *wake > now, "no future pacing wakeup" );
+  require( !client.poll_transmit() && client.next_timeout_us() == wake, "blocked polls moved pacing deadline" );
+  server.send_ping();
+  const auto ping = server.poll_transmit();
+  require( ping.has_value(), "pacing peer PING" );
+  deliver( client, *ping, server_address );
+  const auto ack = client.poll_transmit();
+  require( ack && client.congestion_stats().bytes_in_flight == bytes, "pacing blocked or charged pure ACK" );
+  require( !client.poll_transmit(), "ACK fallback consumed/debited paced PING" );
+  now = *client.next_timeout_us();
+  client.on_timeout();
+  const auto paced = client.poll_transmit();
+  require( paced.has_value(), "pacing wakeup did not release output" );
+  for ( const auto& d : held )
+    require( deliver( server, d, client_address ) != ConnectionReceive::Failed, "paced packet rejected" );
+  require( deliver( server, *ack, client_address ) != ConnectionReceive::Failed, "pacing ACK rejected" );
+  require( deliver( server, *paced, client_address ) != ConnectionReceive::Failed, "paced PN gap" );
+  transfer( server, client, server_address );
+  require( !client.poll_transmit() && !client.next_timeout_us(), "idle connection retained pacing wakeup" );
+}
 void probe_handoff_and_clock()
 {
   uint64_t now = 1000;
@@ -423,9 +479,12 @@ void errors_and_close()
 }
 void amplification_pause()
 {
+  uint64_t now = 1000;
+  auto cc = config( false );
   auto sc = config( true );
+  cc.clock_us = sc.clock_us = [&now] { return now; };
   sc.tls.local_parameters.emplace( 0xface, std::string( 15000, 'x' ) );
-  HandshakeConnection client { config( false ), server_address }, server { sc, client_address };
+  HandshakeConnection client { cc, server_address }, server { sc, client_address };
   const auto first = drain( client );
   size_t received_bytes = 0;
   for ( const auto& d : first ) {
@@ -455,6 +514,10 @@ void amplification_pause()
   // Re-ACKing the duplicate Initial also consumes 1200 amplification bytes.
   // Keep crediting actual arrivals until the complete large TLS flight fits.
   for ( size_t round = 0; round < 8 && client.state() == ConnectionState::Handshaking; ++round ) {
+    if ( const auto due = server.next_timeout_us(); due && *due > now ) {
+      now = *due;
+      server.on_timeout();
+    }
     // Congestion credit is independent of amplification credit. Let real ACKs
     // release the previous server flight before sending the remaining TLS data.
     transfer( client, server, client_address );
@@ -631,6 +694,7 @@ int main()
       recover_dropped_flight( mode );
     initial_ack_exchange();
     congestion_scheduling();
+    pacing_scheduling();
     minimum_receiver( 8 );
     minimum_receiver( 20 );
     positive( false, false );

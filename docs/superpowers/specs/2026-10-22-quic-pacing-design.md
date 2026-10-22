@@ -1,0 +1,11 @@
+# Single-path pacing
+
+Extend existing NewReno on branch quic-v1-proposal, isolated VM worktree /home/huai/minnow-quic-proposal, C++20/Linux/OpenSSL 3.5.9. Implement RFC 9002 section 7.7 rate pacing without changing congestion or recovery algorithms. No streams, persistent congestion, ECN validation or migration in this milestone.
+
+Implementer decisions: byte token bucket, capacity min(cwnd,12000), initially 12000 tokens; rate 1.25*cwnd/max(smoothed_rtt_us,1000). Refill elapsed time at the previously installed rate and capacity, then install new path parameters; clamp credit on window shrink and cap idle accumulation. Exact protected wire bytes, including padding, consume tokens only on poll_transmit handoff. No negative credit from PTO probes: consume remaining credit to zero. Unpadded pure ACK bypasses pacing and does not debit it; padded ACKs remain in flight and paced. PTO probes bypass pacing but debit available credit and retain congestion/anti-amplification/metadata semantics.
+
+Expose PacketPacer::deadline(now,bytes,window,rtt_us) (nullopt if ready) and sent(...). All clocks monotonic microseconds; reverse time/invalid rate/oversize request errors are explicit. Round waits upward, saturate absolute deadlines, permit time zero.
+
+Connection checks exact size, congestion and anti-amplification before handoff. A pacing-blocked data candidate must not consume PN, TLS offset, recovery work or ACK generation; use ACK-only fallback when possible. Cache only the earliest blocked candidate's pacing deadline and merge with recovery in next_timeout_us; no pending work means no pacer-only timer. on_timeout clears due pacing wakeups and independently calls guarded recovery. Input and every poll invalidate old pacing candidate deadlines and recalculate from current work. Anti-amplification blocking suppresses wakeups as before. Event-loop contract remains: after every input/timeout, poll output, then fetch next timeout using the same clock.
+
+Tests cover exact token depletion, fractional refill, idle/window caps, prior-rate accounting, time zero/backward/overflow, ACK and probe exemptions, packet numbering and idle timer cleanup. Existing large-handshake and congestion-fill test drivers must advance injected clocks on pacing wakeups; never sleep or silently disable pacing in tests.

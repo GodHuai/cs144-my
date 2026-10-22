@@ -116,3 +116,5 @@ ttest(quic_acknowledgments)
 ttest(quic_packet_recovery)
 
 ttest(quic_congestion_control)
+
+ttest(quic_pacer)

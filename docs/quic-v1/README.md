@@ -53,6 +53,8 @@
 
 ## 一句话检查当前边界
 
-握手恢复基准为 `7abc5c7`（2026-10-22），后续已接入单路径 NewReno 基础控制；详见 [congestion-control.md](congestion-control.md)。基础编解码、AES 包保护、真实 TLS 1.3、单路径握手连接、双栈 UDP、即时 ACK、有界握手恢复、RTT 与 PTO 已贯通。**可靠应用流、流量控制、持续拥塞/pacing/ECN 及第三方互通仍未完成。** 当前缺口见 [coverage.md](coverage.md)，本阶段测试记录为 QUIC 22/22、全量 53/60，详见 [congestion-control.md](congestion-control.md)。文档中的较早测试数字只代表相应历史里程碑。
+握手恢复基准为 `7abc5c7`（2026-10-22），后续已接入单路径 NewReno 基础控制；详见 [congestion-control.md](congestion-control.md)。基础编解码、AES 包保护、真实 TLS 1.3、单路径握手连接、双栈 UDP、即时 ACK、有界握手恢复、RTT 与 PTO 已贯通。**可靠应用流、流量控制、持续拥塞/ECN 及第三方互通仍未完成。** 当前缺口见 [coverage.md](coverage.md)，NewReno 阶段测试记录为 QUIC 22/22、全量 53/60；最新 pacing 验证见 [pacing.md](pacing.md)。文档中的较早测试数字只代表相应历史里程碑。
 
 构建需要带 external QUIC TLS API 的 OpenSSL ≥3.5（SSL/Crypto）；固定版本和工作树内构建方法见 [tls-handshake.md](tls-handshake.md)。
+
+后续已接入有界令牌桶 pacing：速率随窗口与 RTT 调整，发送唤醒与恢复期限合并，纯 ACK/PTO 探测保留例外。当前实现与验证见 [pacing.md](pacing.md)。

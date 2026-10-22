@@ -1,6 +1,6 @@
 # 单路径 NewReno 与物理在途字节
 
-本阶段在握手恢复上接入 `quic/congestion_control.*`。当前固定路径最大数据报大小为 1200 字节，初始窗口 12000、最小窗口 2400。它是 NewReno 基础实现，尚无持续拥塞检测、pacing、ECN 验证、应用流和迁移；不表示完整 RFC 9002。
+本阶段在握手恢复上接入 `quic/congestion_control.*`。当前固定路径最大数据报大小为 1200 字节，初始窗口 12000、最小窗口 2400。它是 NewReno 基础实现，尚无持续拥塞检测、ECN 验证、应用流和迁移；不表示完整 RFC 9002。
 
 ## 字节额度如何使用
 
@@ -46,3 +46,5 @@ PTO 探测可以超过窗口，但仍增加 bytes_in_flight
 ## 验证记录
 
 本阶段验证：QUIC CTest **22/22**（75.70 秒），全量 **53/60**（115.23 秒）。五项既有 30 秒超时为 `wrapping_integers_roundtrip`、`wrapping_integers_extra`、`recv_transmit`、`recv_reorder_more`、`send_transmit`；`net_interface`、`router` 缺少可执行文件。额外的冗余副本丢失/物理容量边界与阈值断言加入后，恢复及 NewReno sanitizer 程序再次通过。独立审查最终无待处理发现；一条阈值建议经 RFC §7.3.2 / Appendix B.6 核对后撤回，保留“先减半 ssthresh、再对 cwnd 施加最小值”的顺序。
+
+后续已接入有界令牌桶 pacing：速率随窗口与 RTT 调整，发送唤醒与恢复期限合并，纯 ACK/PTO 探测保留例外。当前实现与验证见 [pacing.md](pacing.md)。

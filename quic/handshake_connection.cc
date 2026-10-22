@@ -3,9 +3,11 @@
 #include "acknowledgments.hh"
 #include "anti_amplification.hh"
 #include "initial_packet.hh"
+#include "pacer.hh"
 #include "packet_number_space.hh"
 #include "packet_recovery.hh"
 #include "protected_packet.hh"
+#include <algorithm>
 #include <chrono>
 
 #include <array>
@@ -51,6 +53,8 @@ struct HandshakeConnection::Impl
   std::array<uint64_t, 2> offsets {};
   PacketAcknowledgments acks {};
   PacketRecovery recovery {};
+  PacketPacer pacer {};
+  std::optional<uint64_t> pacing_wakeup {};
   uint64_t last_clock {};
   bool peer_validated {}, amplification_blocked {};
   bool initial_retired {}, handshake_retired {}, done_pending {}, ping_pending {};
@@ -365,6 +369,7 @@ struct HandshakeConnection::Impl
   }
   std::optional<UdpDatagram> transmit()
   {
+    pacing_wakeup.reset();
     if ( terminal( state ) || !tls )
       return std::nullopt;
     const auto exponent
@@ -427,10 +432,35 @@ struct HandshakeConnection::Impl
         if ( !recovery.can_send( kind, wire_size(), false, kind == PacketKind::Initial ) )
           continue;
       }
-      const auto bytes = wire_size();
+      auto bytes = wire_size();
       if ( const auto remaining = budget.remaining_bytes(); remaining && bytes > *remaining ) {
         amplification_blocked = true;
         return std::nullopt;
+      }
+      const auto now = now_us();
+      const auto window = recovery.congestion_stats().window;
+      const auto rtt_us = recovery.rtt().smoothed_ms() * 1000;
+      const auto paced = [&]() -> bool {
+        if ( !eliciting && kind != PacketKind::Initial )
+          return false;
+        if ( retry && retry->probe )
+          return false;
+        const auto due = pacer.deadline( now, bytes, window, rtt_us );
+        if ( !due )
+          return false;
+        pacing_wakeup = pacing_wakeup ? std::min( *pacing_wakeup, *due ) : *due;
+        return true;
+      };
+      if ( paced() ) {
+        if ( !ack )
+          continue;
+        retry.reset();
+        crypto.reset();
+        done = ping = eliciting = false;
+        payload = make_payload();
+        bytes = wire_size();
+        if ( !recovery.can_send( kind, bytes, false, kind == PacketKind::Initial ) || paced() )
+          continue;
       }
       const auto number = numbers.allocate( kind );
       if ( !number ) {
@@ -477,7 +507,9 @@ struct HandshakeConnection::Impl
       else if ( ping )
         data = std::make_shared<RecoveryData>( PingFrame {} );
       acks.sent( kind, *number, eliciting );
-      recovery.sent( kind, *number, now_us(), data, bytes, kind == PacketKind::Initial );
+      recovery.sent( kind, *number, now, data, bytes, kind == PacketKind::Initial );
+      if ( eliciting || kind == PacketKind::Initial )
+        pacer.sent( now, bytes, window, rtt_us );
       if ( ack )
         acks.ack_sent( kind, ack->generation );
       if ( crypto )
@@ -511,6 +543,7 @@ ConnectionReceive HandshakeConnection::receive( const UdpDatagram& datagram )
     return ConnectionReceive::Discarded;
   self.budget.record_received( datagram.payload.size() );
   self.amplification_blocked = false;
+  self.pacing_wakeup.reset();
   bool processed = false;
   try {
     size_t offset = 0;
@@ -550,7 +583,10 @@ std::optional<uint64_t> HandshakeConnection::next_timeout_us() const
   const auto& self = *impl_;
   if ( terminal( self.state ) || !self.tls || self.amplification_blocked )
     return std::nullopt;
-  return self.recovery.deadline( self.recovery_context() );
+  const auto loss = self.recovery.deadline( self.recovery_context() );
+  if ( loss && self.pacing_wakeup )
+    return std::min( *loss, *self.pacing_wakeup );
+  return loss ? loss : self.pacing_wakeup;
 }
 void HandshakeConnection::on_timeout()
 {
@@ -558,7 +594,10 @@ void HandshakeConnection::on_timeout()
   if ( terminal( self.state ) || !self.tls || self.amplification_blocked )
     return;
   try {
-    const auto events = self.recovery.timeout( self.now_us(), self.recovery_context() );
+    const auto now = self.now_us();
+    if ( self.pacing_wakeup && *self.pacing_wakeup <= now )
+      self.pacing_wakeup.reset();
+    const auto events = self.recovery.timeout( now, self.recovery_context() );
     self.release_records( PacketKind::Initial, events[0] );
     self.release_records( PacketKind::Handshake, events[1] );
     self.release_records( PacketKind::OneRtt, events[2] );
