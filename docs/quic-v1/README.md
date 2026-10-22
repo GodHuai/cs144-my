@@ -16,6 +16,7 @@
    [initial-packet.md](initial-packet.md) 逐步拆解 Initial 整包封装、解封和认证顺序。
    [tls-handshake.md](tls-handshake.md) 解释真实 TLS 1.3 握手、证书/ALPN 和加密级别回调。
    [protected-packets.md](protected-packets.md) 解释 TLS secret 怎样派生为 Handshake/1-RTT 包密钥并保护整包。
+   [udp.md](udp.md) 解释双栈非阻塞数据报、ECN 和真实回环加密握手。
    [crypto-streams.md](crypto-streams.md) 解释 TLS 字节的分级别重组、缓冲上限和重传分片。
 3. [coverage.md](coverage.md)：查某条规范现在有代码、有测试，还是尚未开始。
 4. [design.md](design.md) 与 [tasks.md](tasks.md)：完整连接的目标架构和后续工作顺序；它们是计划，不是当前实现证据。
@@ -45,6 +46,6 @@
 
 ## 一句话检查当前边界
 
-已有 QUIC v1 基础编解码、Initial/Handshake/1-RTT 单包保护、分级别 CRYPTO 字节流和真实 TLS 1.3 双端握手；内存测试已贯通受保护握手和双向 1-RTT 数据。**尚无带 UDP、ACK/恢复和流量控制的完整 QUIC 连接**。缺失内容和逐项状态以 [coverage.md](coverage.md) 为准。
+已有 QUIC v1 基础编解码、Initial/Handshake/1-RTT 单包保护、分级别 CRYPTO 字节流和真实 TLS 1.3 双端握手；内存测试已贯通受保护握手和双向 1-RTT 数据；新增双栈 UDP/ECN 接口，真实回环测试已贯通加密握手和 1-RTT 控制帧。**尚无具备 ACK/恢复和流量控制的完整 QUIC 连接**。缺失内容和逐项状态以 [coverage.md](coverage.md) 为准。
 
 构建需要带 external QUIC TLS API 的 OpenSSL ≥3.5（SSL/Crypto）；固定版本和工作树内构建方法见 [tls-handshake.md](tls-handshake.md)。

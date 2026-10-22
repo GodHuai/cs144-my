@@ -106,3 +106,6 @@ stest(reassembler_speed_test)
 
 ttest(quic_tls_handshake)
 ttest(quic_protected_packet)
+
+ttest(quic_udp_socket)
+ttest(quic_udp_handshake)

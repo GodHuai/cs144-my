@@ -383,3 +383,7 @@ ctest --test-dir build --output-on-failure -j2
 2. `pn_offset` 后面只有 19 字节时为什么拒绝？答：报头保护样本必须从 `pn_offset + 4` 开始连续取 16 字节，合计至少 20 字节。
 3. 为什么 ACK 的线上值 3 不能直接传给 `observe()` 作为 3 ms？答：它先要按对端 `ack_delay_exponent` 转成微秒，再转换成估计器使用的毫秒；当前代码缺少这层处理。
 4. 为什么一个 STREAM 帧带 FIN 不代表 UDP 数据报到此结束？答：FIN 是该**流**的最终大小标记；只有缺少 LEN 位的 STREAM 才占满当前包载荷的剩余部分。
+
+## UDP 收发的新进展
+
+`quic/udp_socket.*` 已提供 Linux IPv4/IPv6 非阻塞收发和逐包 ECN；`tests/quic_udp_handshake.cc` 通过真实回环 UDP 贯通 TLS/包保护与 1-RTT 控制帧。详细接口、错误处置、反放大和测试驱动边界见 [udp.md](udp.md)。该驱动没有成为生产连接状态机；前文完整连接的待办仍然适用。
