@@ -1,5 +1,7 @@
 # QUIC v1 实现讲解（进行中）
 
+新增 CRYPTO 收发字节流 `quic/crypto_streams.hh/.cc`：分别维护 Initial、Handshake、1-RTT 的乱序重组、容量和发送 offset；现有 Initial 包保护集成测试覆盖丢失、重复、乱序和篡改。详细接口、错误和边界见 [crypto-streams.md](crypto-streams.md)。它还没有接入真正的 TLS 实现。
+
 新增单个 Initial 包的封装和认证解封原语 `quic/initial_packet.hh/.cc`：它将下述包头、Initial AES-GCM、报头保护和包号恢复按规范顺序组合。完整流程、RFC 附录 A.3 整包向量和边界见 [initial-packet.md](initial-packet.md)。这仍是脱离连接状态机与 UDP 的单包功能。
 
 当前完成 RFC 9000 §16 的变长整数、§17.1 的包号编解码、§12.3 的部分包号空间状态、§17.2–17.3 的部分包头布局（包括版本协商和 Retry 的字段解析）、§18 的传输参数编解码与静态校验、§8.2 的单路径验证状态、§8/§9.3.1 的反放大额度记账、§5.1/§9.5 的对端连接 ID 池、§5.1.1/§19.16 的本端连接 ID 签发与退休状态、§19.1–19.20 的**核心帧线上格式**编解码、RFC 9001 §5.2–5.4 的 Initial 密钥、AES-GCM 载荷和 AES 报头保护基础操作、§5.8 的 Retry 完整性标签，以及 RFC 9002 §5 的 RTT 估计和 §6.2.1 的 PTO 时长计算。它们还没有组成 QUIC 连接；TLS 1.3 握手、Handshake/1-RTT 密钥、Retry 状态机、版本协商处理、ACK 与丢包状态机、UDP 互通仍未完成。扩展帧及逐帧语义也尚未处理。最终以完整协议代码、测试和 `coverage.md` 为准。
@@ -343,7 +345,7 @@ PTO（Probe Timeout）是“等待确认过久时，什么时候尝试发探测�
 
 ## 验证记录与可复现命令
 
-### 本次逐模块复核
+### 历史逐模块复核
 
 | 模块 | 对照规范与检查重点 | 结论范围 |
 | --- | --- | --- |
@@ -368,6 +370,8 @@ ctest --test-dir build --output-on-failure -j2
 补全核心帧并格式化后，QUIC 定向测试（含公共编译夹具）为 **5/5 通过**。同一源码下、无额外 12 秒超时限制的全量 CTest **43 项中 41 项通过**；`net_interface` 与 `router` 因缺少相应的测试可执行文件而未运行，因此全量测试命令退出状态为 8。这组数字是运行记录，不会随着文档编辑自动更新。
 
 代码实现时使用测试先行：先看见缺少接口、缺少 ACK 支持或空载荷缺陷使测试失败，再补实现。独立审查发现的 ACK 取样条件、ACK Delay 上限测试、62 位边界与短包头样本长度问题已修正。本次复核又发现 RTT 变动值与 RFC 9002 勘误的顺序不符：先将断言改为 40 ms，观察到 `quic_packet_primitives` 因得到旧结果 39.6875 ms 而失败；再调整实现顺序，定向测试恢复通过。各里程碑的任务与具体测试范围记录在 `docs/superpowers/plans/2026-10-19-quic-packet-primitives.md`、`2026-10-19-quic-basic-frames.md` 和 `2026-10-19-quic-packet-header.md`。
+
+以上 5/5 与 41/43 是历史记录；新增 CRYPTO 模块后的 QUIC 专项为 14/14（含编译夹具），当前复核记录见 `crypto-streams.md`。
 
 ## 自测：能否用自己的话解释
 

@@ -141,3 +141,9 @@ add_dependencies(functionality_testing quic_initial_packet_sanitized)
 
 add_speed_test(byte_stream_speed_test)
 add_speed_test(reassembler_speed_test)
+
+add_executable(quic_crypto_streams_sanitized EXCLUDE_FROM_ALL quic_crypto_streams.cc)
+target_compile_options(quic_crypto_streams_sanitized PUBLIC ${SANITIZING_FLAGS})
+target_link_options(quic_crypto_streams_sanitized PUBLIC ${SANITIZING_FLAGS})
+target_link_libraries(quic_crypto_streams_sanitized quic_sanitized)
+add_dependencies(functionality_testing quic_crypto_streams_sanitized)

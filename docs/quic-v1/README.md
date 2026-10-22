@@ -14,6 +14,7 @@
    [initial-packet-protection.md](initial-packet-protection.md) 手算 Initial 密钥、AES-GCM 载荷和报头掩码。
    [retry-integrity.md](retry-integrity.md) 解释 Retry 伪包和接收前的完整性验证。
    [initial-packet.md](initial-packet.md) 逐步拆解 Initial 整包封装、解封和认证顺序。
+   [crypto-streams.md](crypto-streams.md) 解释 TLS 字节的分级别重组、缓冲上限和重传分片。
 3. [coverage.md](coverage.md)：查某条规范现在有代码、有测试，还是尚未开始。
 4. [design.md](design.md) 与 [tasks.md](tasks.md)：完整连接的目标架构和后续工作顺序；它们是计划，不是当前实现证据。
 5. `docs/superpowers/specs/`、`docs/superpowers/plans/`：每一轮小功能的设计与测试记录。
@@ -35,10 +36,11 @@
 | Initial 包怎样派生密钥并保护载荷？ | RFC 9001 §5.1–5.4 | [initial_keys.hh](../../quic/initial_keys.hh)、[initial_keys.cc](../../quic/initial_keys.cc) | [quic_initial_keys.cc](../../tests/quic_initial_keys.cc) |
 | Initial 包如何完成整包封装和认证解封？ | RFC 9000 §17.2.2、RFC 9001 §5.3–5.4 | [initial_packet.hh](../../quic/initial_packet.hh)、[initial_packet.cc](../../quic/initial_packet.cc) | [quic_initial_packet.cc](../../tests/quic_initial_packet.cc) |
 | 怎样验证 Retry 确实对应最初的 Initial？ | RFC 9001 §5.8 | [retry_integrity.hh](../../quic/retry_integrity.hh)、[retry_integrity.cc](../../quic/retry_integrity.cc) | [quic_retry_integrity.cc](../../tests/quic_retry_integrity.cc) |
+| 怎样将乱序 CRYPTO 帧还原为 TLS 字节，并保留重传数据？ | RFC 9000 §7.5、§19.6，RFC 9001 §4.1.3 | [crypto_streams.hh](../../quic/crypto_streams.hh)、[crypto_streams.cc](../../quic/crypto_streams.cc) | [quic_crypto_streams.cc](../../tests/quic_crypto_streams.cc) |
 | 收到 ACK 后如何更新 RTT 和 PTO？ | RFC 9002 §5–6 | [rtt_estimator.hh](../../quic/rtt_estimator.hh)、[rtt_estimator.cc](../../quic/rtt_estimator.cc) | [quic_packet_primitives.cc](../../tests/quic_packet_primitives.cc) |
 
 ## 一句话检查当前边界
 
-可以编码和解析部分 QUIC v1 字段；**还不能发送或接收一个经过 TLS 与 AEAD 认证的完整 QUIC 连接**。缺失内容和逐项状态以 [coverage.md](coverage.md) 为准。
+已有 QUIC v1 基础编解码、Initial 单包保护和分级别 CRYPTO 字节流；**还不能发送或接收一个经过 TLS 与 AEAD 认证的完整 QUIC 连接**。缺失内容和逐项状态以 [coverage.md](coverage.md) 为准。
 
 构建 QUIC 加密模块需要 OpenSSL 3 的开发头文件与 `libcrypto`；CMake 会检查此依赖。

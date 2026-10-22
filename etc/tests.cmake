@@ -65,6 +65,7 @@ ttest(quic_local_connection_ids)
 ttest(quic_initial_keys)
 ttest(quic_retry_integrity)
 ttest(quic_initial_packet)
+ttest(quic_crypto_streams)
 
 ttest(net_interface)
 
