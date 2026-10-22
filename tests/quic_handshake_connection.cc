@@ -155,6 +155,71 @@ void discarded_inputs()
     deliver( client, d, server_address );
   require( client.state() == ConnectionState::Established, "queued invalid packets blocked real flight" );
 }
+void recover_dropped_flight( size_t mode )
+{
+  uint64_t now = 1000;
+  auto cc = config( false ), sc = config( true );
+  cc.clock_us = sc.clock_us = [&now] { return now; };
+  HandshakeConnection client { cc, server_address }, server { sc, client_address };
+  size_t dropped = 0;
+  size_t packets = 0;
+  for ( size_t round = 0; round < 100; ++round ) {
+    bool output = false;
+    const auto pump = [&]( HandshakeConnection& from, HandshakeConnection& to, bool from_server ) {
+      for ( const auto& d : drain( from ) ) {
+        output = true;
+        require( ++packets < 300, "unbounded loss recovery traffic" );
+        const auto layout = parse_protected_packet( d.payload, 0, 8 );
+        require( layout.has_value(), "recovery output malformed" );
+        const bool match
+          = ( ( mode == 0 || mode == 6 ) && !from_server && layout->kind == PacketKind::Initial )
+            || ( mode == 1 && from_server && layout->kind == PacketKind::Initial )
+            || ( ( mode == 2 || mode == 7 ) && from_server && layout->kind == PacketKind::Handshake )
+            || ( ( mode == 3 || mode == 9 ) && !from_server && layout->kind == PacketKind::Handshake )
+            || ( ( mode == 4 || mode == 8 ) && from_server && layout->kind == PacketKind::OneRtt )
+            || ( mode == 5 && !from_server && layout->kind == PacketKind::OneRtt );
+        if ( match && dropped < ( mode < 6 ? 1U : 3U ) ) {
+          ++dropped;
+          continue;
+        }
+        now += 1000;
+        require( deliver( to, d, from_server ? server_address : client_address ) != ConnectionReceive::Failed,
+                 "retransmission broke handshake" );
+      }
+    };
+    pump( client, server, false );
+    pump( server, client, true );
+    if ( client.state() == ConnectionState::Confirmed && server.state() == ConnectionState::Confirmed
+         && client.packets_awaiting_ack( PacketKind::OneRtt ) == 0
+         && server.packets_awaiting_ack( PacketKind::OneRtt ) == 0 && !output )
+      break;
+    if ( !output ) {
+      const auto a = client.next_timeout_us(), b = server.next_timeout_us();
+      require( a || b, "loss recovery has no timer or output" );
+      now = std::max( now, a && b ? std::min( *a, *b ) : a.value_or( b.value_or( now ) ) );
+      if ( a && *a <= now )
+        client.on_timeout();
+      if ( b && *b <= now )
+        server.on_timeout();
+    }
+  }
+  require( dropped && client.state() == ConnectionState::Confirmed && server.state() == ConnectionState::Confirmed,
+           "dropped flight did not recover" );
+  require( !client.next_timeout_us() && !server.next_timeout_us(), "retired/acknowledged recovery timer retained" );
+  // The server Initial's loss can also lose its ACK of the client's flight.
+  // Key retirement may then finish before the client gets any RTT sample.
+  require( client.send_ping() && server.send_ping(), "RTT test PING queue" );
+  for ( size_t i = 0; i < 4; ++i ) {
+    now += 1000;
+    transfer( client, server, client_address );
+    now += 1000;
+    transfer( server, client, server_address );
+  }
+  require( client.rtt_estimate().min_ms() && server.rtt_estimate().min_ms(),
+           std::string { "RTT not connected mode=" } + std::to_string( mode )
+             + " client=" + std::to_string( client.rtt_estimate().latest_ms() )
+             + " server=" + std::to_string( server.rtt_estimate().latest_ms() ) );
+}
 void initial_ack_exchange()
 {
   HandshakeConnection server { config( true ), client_address };
@@ -186,6 +251,92 @@ void initial_ack_exchange()
     = seal_initial_packet( keys->client, InitialSender::Client, "serverid", "clientid", "", 3, 4, payload );
   require( server.receive( { client_address, wire, 0 } ) == ConnectionReceive::Processed && !server.poll_transmit(),
            "ACK-only input created feedback" );
+}
+void probe_handoff_and_clock()
+{
+  uint64_t now = 1000;
+  auto cc = config( false );
+  cc.clock_us = [&now] { return now; };
+  HandshakeConnection client { cc, server_address };
+  require( !client.next_timeout_us(), "timer before actual Initial handoff" );
+  const auto first = drain( client );
+  const auto due = client.next_timeout_us();
+  require( due && *due == now + 999000, "Initial send time not used" );
+  now = *due - 1;
+  client.on_timeout();
+  require( !client.poll_transmit(), "PTO fired early" );
+  now = *due;
+  client.on_timeout();
+  client.on_timeout();
+  const auto probe = drain( client );
+  require( probe.size() == 1 && probe.front().payload.size() == 1200, "PTO probe handoff count or size" );
+  const auto keys = derive_initial_keys( "original" );
+  const auto original
+    = open_initial_packet( keys->client, InitialSender::Client, first.front().payload, 0, std::nullopt );
+  const auto repeated
+    = open_initial_packet( keys->client, InitialSender::Client, probe.front().payload, 0, std::nullopt );
+  require( original && repeated && repeated->packet_number >= first.size()
+             && repeated->plaintext == original->plaintext && probe.front().payload != first.front().payload,
+           "PTO must replay original CRYPTO in new protected packet number" );
+  require( client.next_timeout_us() == now + 1998000, "PTO handoff did not rearm doubled interval" );
+  now = 1;
+  client.on_timeout();
+  require( client.state() == ConnectionState::Failed && client.transport_error() == 0x01
+             && !client.next_timeout_us(),
+           "non-monotonic clock was not terminal" );
+}
+void finished_probe_backoff()
+{
+  uint64_t now = 1000;
+  auto cc = config( false ), sc = config( true );
+  cc.clock_us = sc.clock_us = [&now] { return now; };
+  HandshakeConnection client { cc, server_address }, server { sc, client_address };
+  transfer( client, server, client_address );
+  transfer( server, client, server_address );
+  require( client.state() == ConnectionState::Established, "Finished backoff setup" );
+  require( !drain( client ).empty(), "Finished missing" ); // Drop the Finished flight.
+  const auto first_due = client.next_timeout_us();
+  require( first_due.has_value(), "Finished PTO missing" );
+  const auto period = *first_due - now;
+  uint64_t multiplier = 1;
+  for ( size_t attempt = 0; attempt < 3; ++attempt ) {
+    now = *client.next_timeout_us();
+    client.on_timeout();
+    require( drain( client ).size() == 1, "Finished probe missing" ); // Drop again.
+    multiplier *= 2;
+    require( client.next_timeout_us() == now + period * multiplier,
+             "repeated Initial retirement reset Finished PTO backoff" );
+  }
+}
+void server_initial_ack_resets_backoff()
+{
+  uint64_t now = 1000;
+  auto cc = config( false ), sc = config( true );
+  cc.clock_us = sc.clock_us = [&now] { return now; };
+  HandshakeConnection client { cc, server_address }, server { sc, client_address };
+  const auto first = drain( client );
+  for ( const auto& d : first )
+    deliver( server, d, client_address );
+  require( !drain( server ).empty(), "server backoff setup flight missing" );
+  const auto due = server.next_timeout_us();
+  require( due.has_value(), "server backoff setup timer missing" );
+  now = *due;
+  server.on_timeout();
+  const auto probe = drain( server );
+  require( probe.size() == 1, "server Initial probe missing" );
+  const auto keys = derive_initial_keys( "original" );
+  const auto opened
+    = open_initial_packet( keys->server, InitialSender::Server, probe.front().payload, 0, std::nullopt );
+  require( opened.has_value(), "server probe must be Initial" );
+  auto payload = encode_frame( AckFrame { 0, { { 0, opened->packet_number } }, std::nullopt } );
+  payload.resize( 1200, '\0' );
+  const auto wire = seal_initial_packet(
+    keys->client, InitialSender::Client, "serverid", "clientid", "", first.size(), 4, payload );
+  now += 1000;
+  require( server.receive( { client_address, wire, 0 } ) == ConnectionReceive::Processed,
+           "server Initial ACK rejected" );
+  const auto base = static_cast<uint64_t>( *server.rtt_estimate().pto_ms( false, false, 0 ) * 1000 );
+  require( server.next_timeout_us() == 1000 + base, "server Initial ACK did not reset PTO backoff" );
 }
 void errors_and_close()
 {
@@ -238,6 +389,9 @@ void amplification_pause()
   require( client.state() == ConnectionState::Handshaking && !server.poll_transmit(),
            "large flight did not pause" );
   require( !server.poll_transmit(), "blocked polling consumed budget or created output" );
+  require( !server.next_timeout_us(), "amplification-blocked timer causes event-loop spin" );
+  server.on_timeout();
+  require( !server.poll_transmit(), "timeout bypassed amplification cap" );
   // New UDP bytes may increase the cap even if the protected packet is a duplicate.
   for ( const auto& d : first )
     deliver( server, d, client_address );
@@ -414,6 +568,11 @@ int main()
 {
   try {
     authenticated_initial_error();
+    server_initial_ack_resets_backoff();
+    finished_probe_backoff();
+    probe_handoff_and_clock();
+    for ( size_t mode = 0; mode < 10; ++mode )
+      recover_dropped_flight( mode );
     initial_ack_exchange();
     minimum_receiver( 8 );
     minimum_receiver( 20 );

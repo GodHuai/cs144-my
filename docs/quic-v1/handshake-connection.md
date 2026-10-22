@@ -28,7 +28,7 @@
 
 ## 当前支持范围
 
-支持握手 CRYPTO、PADDING、PING、HANDSHAKE_DONE 和对端关闭。ACK 已接入生成与发送记录更新，详见 [acknowledgments.md](acknowledgments.md)；尚无 RTT 接线、重传、PTO、拥塞控制或 ECN 验证。`send_ping()` 最多保留一个待发 PING。
+支持握手 CRYPTO、PADDING、PING、HANDSHAKE_DONE 和对端关闭。ACK 已接入生成与发送记录更新，详见 [acknowledgments.md](acknowledgments.md)；RTT、握手帧重传和 PTO 现已接入，见 [loss-recovery.md](loss-recovery.md)；拥塞控制和 ECN 验证仍缺失。`send_ping()` 最多保留一个待发 PING。
 
 STREAM、流量控制、连接 ID 生命周期、路径控制及其它未实现语义不会被交给应用，认证后遇到它们以本地 INTERNAL_ERROR (`0x01`) 结束；这不表示它们本身都是对端协议违规。后握手 CRYPTO 和密钥更新也尚不支持。该类不接受 Retry、0-RTT、版本协商或恢复，不提供监听器、动态多连接分发、空闲超时及外部互通保证。
 

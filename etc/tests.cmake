@@ -112,3 +112,5 @@ ttest(quic_udp_handshake)
 ttest(quic_handshake_connection)
 
 ttest(quic_acknowledgments)
+
+ttest(quic_packet_recovery)

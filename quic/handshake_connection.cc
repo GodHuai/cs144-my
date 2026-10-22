@@ -4,6 +4,7 @@
 #include "anti_amplification.hh"
 #include "initial_packet.hh"
 #include "packet_number_space.hh"
+#include "packet_recovery.hh"
 #include "protected_packet.hh"
 #include <chrono>
 
@@ -19,7 +20,7 @@ size_t index( PacketKind kind )
 {
   return static_cast<size_t>( packet_number_space( kind ) );
 }
-uint64_t now_us()
+uint64_t default_now_us()
 {
   return static_cast<uint64_t>(
     std::chrono::duration_cast<std::chrono::microseconds>( std::chrono::steady_clock::now().time_since_epoch() )
@@ -49,6 +50,9 @@ struct HandshakeConnection::Impl
   AntiAmplificationBudget budget;
   std::array<uint64_t, 2> offsets {};
   PacketAcknowledgments acks {};
+  PacketRecovery recovery {};
+  uint64_t last_clock {};
+  bool peer_validated {}, amplification_blocked {};
   bool initial_retired {}, handshake_retired {}, done_pending {}, ping_pending {};
   std::deque<std::string> pending {};
   size_t pending_bytes {};
@@ -62,17 +66,55 @@ struct HandshakeConnection::Impl
     bool ping;
     bool eliciting;
     std::optional<uint64_t> ack_generation;
+    std::shared_ptr<RecoveryData> data;
   };
   std::optional<Prepared> prepared {};
 
+  uint64_t now_us()
+  {
+    const auto now = config.clock_us ? config.clock_us() : default_now_us();
+    if ( now < last_clock )
+      throw std::logic_error( "QUIC clock moved backwards" );
+    last_clock = now;
+    return now;
+  }
+  RecoveryContext recovery_context() const
+  {
+    RecoveryContext c;
+    c.confirmed = state == ConnectionState::Confirmed;
+    // Recovery asks whether the peer has validated us. Our own validation of
+    // its address is a separate anti-amplification decision.
+    c.peer_validated = config.tls.server || c.confirmed || peer_validated;
+    if ( tls ) {
+      if ( auto params = tls->peer_parameters() ) {
+        c.max_ack_delay_ms = static_cast<double>( transport_parameter_integer( *params, 0x0b ).value_or( 25 ) );
+        c.ack_delay_exponent = static_cast<uint8_t>( transport_parameter_integer( *params, 0x0a ).value_or( 3 ) );
+      }
+      if ( !config.tls.server && !c.peer_validated ) {
+        if ( !handshake_retired && tls->secret( PacketKind::Handshake, true ) )
+          c.validation_probe_space = PacketKind::Handshake;
+        else if ( !initial_retired )
+          c.validation_probe_space = PacketKind::Initial;
+      }
+    }
+    return c;
+  }
+  void release_records( PacketKind kind, const std::vector<uint64_t>& numbers_to_release )
+  {
+    for ( const auto number : numbers_to_release )
+      acks.release( kind, number );
+  }
   void clear_initial()
   {
+    if ( initial_retired )
+      return;
     if ( initial ) {
       OPENSSL_cleanse( &*initial, sizeof( *initial ) );
       initial.reset();
     }
     initial_retired = true;
     acks.discard( PacketKind::Initial );
+    recovery.discard( PacketKind::Initial );
     if ( tls )
       tls->discard_keys( PacketKind::Initial );
     if ( prepared && prepared->kind == PacketKind::Initial )
@@ -80,8 +122,11 @@ struct HandshakeConnection::Impl
   }
   void clear_handshake()
   {
+    if ( handshake_retired )
+      return;
     handshake_retired = true;
     acks.discard( PacketKind::Handshake );
+    recovery.discard( PacketKind::Handshake );
     tls->discard_keys( PacketKind::Handshake );
     if ( prepared && prepared->kind == PacketKind::Handshake )
       prepared.reset();
@@ -99,7 +144,9 @@ struct HandshakeConnection::Impl
     prepared.reset();
     done_pending = ping_pending = false;
     acks.discard( PacketKind::Handshake );
+    recovery.discard( PacketKind::Handshake );
     acks.discard( PacketKind::OneRtt );
+    recovery.discard( PacketKind::OneRtt );
   }
   void advance()
   {
@@ -293,7 +340,10 @@ struct HandshakeConnection::Impl
     }
     for ( const auto& frame : *frames ) {
       if ( const auto* ack = std::get_if<AckFrame>( &frame ) ) {
+        if ( kind == PacketKind::Handshake || kind == PacketKind::OneRtt )
+          peer_validated = true;
         acks.apply_ack( kind, *ack );
+        release_records( kind, recovery.acknowledged( kind, *ack, now_us(), recovery_context() ) );
       } else if ( const auto* crypto = std::get_if<CryptoFrame>( &frame ) ) {
         if ( !tls->receive( kind, *crypto ) ) {
           stop( ConnectionState::Failed, tls->transport_error().value_or( 0x01 ) );
@@ -337,6 +387,7 @@ struct HandshakeConnection::Impl
       return std::nullopt;
     if ( !prepared ) {
       std::optional<CryptoFrame> crypto {};
+      std::optional<RecoverySend> retry {};
       std::optional<PacketAcknowledgments::PendingAck> ack {};
       PacketKind kind = PacketKind::OneRtt;
       bool done = false, ping = false;
@@ -350,14 +401,17 @@ struct HandshakeConnection::Impl
           continue;
         ack = acks.pending_ack( level, now_us(), exponent );
         if ( acks.can_send( level ) ) {
-          if ( level != PacketKind::OneRtt )
+          retry = recovery.take_pending( level );
+          if ( retry ) {
+            // Replayed CRYPTO is already counted in the fresh TLS send cursor.
+          } else if ( level != PacketKind::OneRtt )
             crypto = tls->outgoing( level, offsets[index( level )], ack ? 400 : 600 );
           else {
             done = done_pending;
             ping = !done && ping_pending;
           }
         }
-        if ( crypto || ack || done || ping ) {
+        if ( retry || crypto || ack || done || ping ) {
           kind = level;
           selected = true;
           break;
@@ -373,7 +427,9 @@ struct HandshakeConnection::Impl
       std::string payload;
       if ( ack )
         payload += encode_frame( ack->frame );
-      if ( crypto )
+      if ( retry )
+        payload += encode_frame( retry->data->frame );
+      else if ( crypto )
         payload += encode_frame( *crypto );
       else if ( done )
         payload += encode_frame( HandshakeDoneFrame {} );
@@ -406,20 +462,36 @@ struct HandshakeConnection::Impl
                  ? seal_handshake_packet( keys, *peer_id, config.local_cid, *number, 4, payload )
                  : seal_one_rtt_packet( keys, *peer_id, *number, 4, payload );
       }
+      std::shared_ptr<RecoveryData> data;
+      if ( retry )
+        data = retry->data;
+      else if ( crypto )
+        data = std::make_shared<RecoveryData>( *crypto );
+      else if ( done )
+        data = std::make_shared<RecoveryData>( HandshakeDoneFrame {} );
+      else if ( ping )
+        data = std::make_shared<RecoveryData>( PingFrame {} );
       prepared = Prepared { kind,
                             *number,
                             std::move( wire ),
                             crypto ? crypto->data.size() : 0,
                             done,
                             ping,
-                            bool( crypto ) || done || ping,
-                            ack ? std::optional<uint64_t> { ack->generation } : std::nullopt };
+                            bool( data ),
+                            ack ? std::optional<uint64_t> { ack->generation } : std::nullopt,
+                            std::move( data ) };
     }
-    if ( !budget.record_sent( prepared->wire.size() ) )
+    if ( !budget.record_sent( prepared->wire.size() ) ) {
+      amplification_blocked = true;
       return std::nullopt;
+    }
+    amplification_blocked = false;
     auto output = std::move( *prepared );
     prepared.reset();
     acks.sent( output.kind, output.number, output.eliciting );
+    recovery.sent( output.kind, output.number, now_us(), output.data );
+    if ( output.data && output.data->acknowledged )
+      acks.release( output.kind, output.number );
     if ( output.ack_generation )
       acks.ack_sent( output.kind, *output.ack_generation );
     if ( output.crypto_length )
@@ -450,6 +522,7 @@ ConnectionReceive HandshakeConnection::receive( const UdpDatagram& datagram )
   if ( self.config.tls.server && datagram.payload.size() < 1200 && first->kind == PacketKind::Initial )
     return ConnectionReceive::Discarded;
   self.budget.record_received( datagram.payload.size() );
+  self.amplification_blocked = false;
   bool processed = false;
   try {
     size_t offset = 0;
@@ -483,6 +556,31 @@ std::optional<UdpDatagram> HandshakeConnection::poll_transmit()
     impl_->stop( ConnectionState::Failed, 0x01 );
     return std::nullopt;
   }
+}
+std::optional<uint64_t> HandshakeConnection::next_timeout_us() const
+{
+  const auto& self = *impl_;
+  if ( terminal( self.state ) || !self.tls || self.amplification_blocked )
+    return std::nullopt;
+  return self.recovery.deadline( self.recovery_context() );
+}
+void HandshakeConnection::on_timeout()
+{
+  auto& self = *impl_;
+  if ( terminal( self.state ) || !self.tls || self.amplification_blocked )
+    return;
+  try {
+    const auto events = self.recovery.timeout( self.now_us(), self.recovery_context() );
+    self.release_records( PacketKind::Initial, events[0] );
+    self.release_records( PacketKind::Handshake, events[1] );
+    self.release_records( PacketKind::OneRtt, events[2] );
+  } catch ( ... ) {
+    self.stop( ConnectionState::Failed, 0x01 );
+  }
+}
+RttEstimator HandshakeConnection::rtt_estimate() const
+{
+  return impl_->recovery.rtt();
 }
 size_t HandshakeConnection::packets_awaiting_ack( PacketKind kind ) const
 {

@@ -26,6 +26,7 @@ public:
   void sent( PacketKind kind, uint64_t number, bool ack_eliciting );
   bool valid_ack( PacketKind kind, const AckFrame& ack ) const;
   void apply_ack( PacketKind kind, const AckFrame& ack );
+  void release( PacketKind kind, uint64_t number );
   size_t outstanding( PacketKind kind ) const;
   void discard( PacketKind kind );
 

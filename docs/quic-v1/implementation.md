@@ -394,3 +394,6 @@ ctest --test-dir build --output-on-failure -j2
 
 
 ACK 里程碑：即时确认、分空间的有界发送记录与认证重复包重新确认已接入连接，见 [acknowledgments.md](acknowledgments.md)。前文关于 ACK 完全缺失的历史描述已由此替代；RTT 接线、丢包恢复、PTO 和拥塞控制仍待实现。
+
+
+2026-10-22 恢复阶段：新增 `PacketRecovery` 和连接超时 API，接入发送时间、RTT、包号/时间阈值与 PTO，用新包号重发握手 CRYPTO/HANDSHAKE_DONE/PING。确定性丢包测试覆盖六种握手包/ACK 丢失，详见 [loss-recovery.md](loss-recovery.md)。相关旧文中的恢复缺失描述由本段更新；任务 6 仍因应用流恢复及完整 RFC 边界尚缺而未完成，任务 7 拥塞控制也未完成。

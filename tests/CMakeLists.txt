@@ -199,3 +199,9 @@ target_compile_options(quic_acknowledgments_sanitized PUBLIC ${SANITIZING_FLAGS}
 target_link_options(quic_acknowledgments_sanitized PUBLIC ${SANITIZING_FLAGS})
 target_link_libraries(quic_acknowledgments_sanitized quic_sanitized)
 add_dependencies(functionality_testing quic_acknowledgments_sanitized)
+
+add_executable(quic_packet_recovery_sanitized EXCLUDE_FROM_ALL quic_packet_recovery.cc)
+target_compile_options(quic_packet_recovery_sanitized PUBLIC ${SANITIZING_FLAGS})
+target_link_options(quic_packet_recovery_sanitized PUBLIC ${SANITIZING_FLAGS})
+target_link_libraries(quic_packet_recovery_sanitized quic_sanitized)
+add_dependencies(functionality_testing quic_packet_recovery_sanitized)

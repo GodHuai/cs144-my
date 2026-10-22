@@ -14,3 +14,6 @@
 
 
 本轮验证：QUIC CTest 20/20；全量 51/58。既有超时为 wrapping_integers_roundtrip、wrapping_integers_extra、recv_transmit、recv_reorder_more、send_transmit；net_interface 与 router 缺少可执行文件。独立审查未发现 Critical/Important/Minor 问题，并独立运行两个 sanitizer 测试通过。因既有全量失败，本轮仅保留分支内本地提交。
+
+
+后续恢复里程碑已增加发送时间、RTT 接线、阈值丢失和握手帧 PTO 重发，见 [loss-recovery.md](loss-recovery.md)。前文“尚未实现”的这些项目为本里程碑完成时的边界；拥塞控制和可靠应用流仍未实现。活动发送计数现会在声明丢失或同一逻辑帧被其他副本确认后释放。

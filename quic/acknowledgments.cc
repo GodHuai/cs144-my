@@ -113,6 +113,10 @@ void PacketAcknowledgments::apply_ack( PacketKind kind, const AckFrame& ack )
   for ( const auto& r : ack.ranges )
     s.outstanding.erase( s.outstanding.lower_bound( r.smallest ), s.outstanding.upper_bound( r.largest ) );
 }
+void PacketAcknowledgments::release( PacketKind kind, uint64_t number )
+{
+  state( kind ).outstanding.erase( number );
+}
 size_t PacketAcknowledgments::outstanding( PacketKind kind ) const
 {
   return state( kind ).outstanding.size();
