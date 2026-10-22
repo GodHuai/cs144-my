@@ -1,10 +1,12 @@
 # QUIC v1 实现讲解（进行中）
 
-新增 CRYPTO 收发字节流 `quic/crypto_streams.hh/.cc`：分别维护 Initial、Handshake、1-RTT 的乱序重组、容量和发送 offset；现有 Initial 包保护集成测试覆盖丢失、重复、乱序和篡改。详细接口、错误和边界见 [crypto-streams.md](crypto-streams.md)。它还没有接入真正的 TLS 实现。
+新增 `quic/tls_handshake.hh/.cc`：通过 OpenSSL 3.5 external QUIC TLS API 完成真实 TLS 1.3 握手，验证 CA、主机名、ALPN 和传输参数，独立维护读写级别及 traffic secret。构建方法、接口和边界见 [tls-handshake.md](tls-handshake.md)。
+
+新增 CRYPTO 收发字节流 `quic/crypto_streams.hh/.cc`：分别维护 Initial、Handshake、1-RTT 的乱序重组、容量和发送 offset；现有 Initial 包保护集成测试覆盖丢失、重复、乱序和篡改。详细接口、错误和边界见 [crypto-streams.md](crypto-streams.md)。它现已通过 `TlsHandshake` 接入 TLS。
 
 新增单个 Initial 包的封装和认证解封原语 `quic/initial_packet.hh/.cc`：它将下述包头、Initial AES-GCM、报头保护和包号恢复按规范顺序组合。完整流程、RFC 附录 A.3 整包向量和边界见 [initial-packet.md](initial-packet.md)。这仍是脱离连接状态机与 UDP 的单包功能。
 
-当前完成 RFC 9000 §16 的变长整数、§17.1 的包号编解码、§12.3 的部分包号空间状态、§17.2–17.3 的部分包头布局（包括版本协商和 Retry 的字段解析）、§18 的传输参数编解码与静态校验、§8.2 的单路径验证状态、§8/§9.3.1 的反放大额度记账、§5.1/§9.5 的对端连接 ID 池、§5.1.1/§19.16 的本端连接 ID 签发与退休状态、§19.1–19.20 的**核心帧线上格式**编解码、RFC 9001 §5.2–5.4 的 Initial 密钥、AES-GCM 载荷和 AES 报头保护基础操作、§5.8 的 Retry 完整性标签，以及 RFC 9002 §5 的 RTT 估计和 §6.2.1 的 PTO 时长计算。它们还没有组成 QUIC 连接；TLS 1.3 握手、Handshake/1-RTT 密钥、Retry 状态机、版本协商处理、ACK 与丢包状态机、UDP 互通仍未完成。扩展帧及逐帧语义也尚未处理。最终以完整协议代码、测试和 `coverage.md` 为准。
+当前完成 RFC 9000 §16 的变长整数、§17.1 的包号编解码、§12.3 的部分包号空间状态、§17.2–17.3 的部分包头布局（包括版本协商和 Retry 的字段解析）、§18 的传输参数编解码与静态校验、§8.2 的单路径验证状态、§8/§9.3.1 的反放大额度记账、§5.1/§9.5 的对端连接 ID 池、§5.1.1/§19.16 的本端连接 ID 签发与退休状态、§19.1–19.20 的**核心帧线上格式**编解码、RFC 9001 §5.2–5.4 的 Initial 密钥、AES-GCM 载荷和 AES 报头保护基础操作、§5.8 的 Retry 完整性标签，以及 RFC 9002 §5 的 RTT 估计和 §6.2.1 的 PTO 时长计算。它们还没有组成 QUIC 连接；Handshake/1-RTT secret 的包密钥派生及整包保护、Retry 状态机、版本协商处理、ACK 与丢包状态机、UDP 互通仍未完成。扩展帧及逐帧语义也尚未处理。最终以完整协议代码、测试和 `coverage.md` 为准。
 
 这份笔记按初学者能逐步手算的顺序编写：每节先说 RFC 规定什么，再解释为什么，最后回到当前 C++ 源码。笔记中的代码片段只摘取决定行为的语句；完整可编译代码以相应 `quic/*.hh`、`quic/*.cc` 和 `tests/quic_*.cc` 为准，避免复制一份会随实现变化而失真的源码。
 
@@ -38,7 +40,7 @@ flowchart LR
 | `parse_protected_packet` | 输入是数据报，`offset` 是当前包起点；短包头需已知 DCID 长度 | 得 `pn_offset`、`packet_end` 等布局；不支持或截断时得 `nullopt` |
 | `build_long_header` / `build_short_header` | 密文长度包括 AEAD tag；包号长度 1–4 | 得未保护包头；不合法构造请求抛异常 |
 | `decode_frames` / `encode_frame` | 解码输入应来自已认证的包载荷 | 得帧列表或单帧字节；截断/不支持得 `nullopt`，非法编码请求抛异常 |
-| `decode_transport_parameters` / `encode_transport_parameters` / `validate_transport_parameters` | TLS 扩展原始字节；角色验证须提供实际 Initial/Retry 包头里的 CID | 解码拒绝重复/非法值，编码拒绝非法本地值，角色验证返回 `bool`；尚未接入 TLS |
+| `decode_transport_parameters` / `encode_transport_parameters` / `validate_transport_parameters` | TLS 扩展原始字节；角色验证须提供实际 Initial/Retry 包头里的 CID | 解码拒绝重复/非法值，编码拒绝非法本地值，角色验证返回 `bool`；已由 `TlsHandshake` 接入 TLS 扩展 |
 | `PathValidation::start` / `record_sent_challenge` / `on_response` / `expire` | 每条候选路径一个实例；挑战值由安全随机源生成；仅记录实际发送的探测与认证成功的回应 | 返回验证阶段，区分地址可达与 1200 字节 MTU；未接入 UDP 或迁移决策 |
 | `AntiAmplificationBudget::record_received` / `record_sent` / `validate_address` | 每个对端地址一个实例；构造时标记发起者或回应者；输入为能唯一归属连接的整个 UDP 载荷字节数 | 回应未验证地址时最多发送接收量的三倍；客户端 Initial 和主动迁移不受该规则限制；尚无 UDP 归属和发送失败回滚接线 |
 | `PeerConnectionIds::on_new_id` / `select_for_path` / `retire_path` / `pending_retirements` | 输入来自已认证的包；路径键由连接层提供唯一的本地/远端地址对 | 跟踪对端签发的 CID、退休门槛、路径绑定、旧路径主动退休与资源限额；尚无发送帧、路由和生命周期接线 |
@@ -303,7 +305,7 @@ for ( size_t i = 0; i < pn_length; ++i )
 
 异或同一个 mask 两次能恢复原值，但发送和接收不能简单调用同一个步骤顺序，因为接收端一开始不知道正确的包号长度。`remove_header_mask()` 在检查字段足够长后才修改报文；这一点防止畸形短包留下“首字节已改、包号还没改”的半修改状态。
 
-这两个函数接收**已经生成的五字节掩码**。Initial 包的 AES 掩码和 AES-GCM 载荷认证现由 `initial_keys.cc` 提供，推导与向量见 [initial-packet-protection.md](initial-packet-protection.md)。TLS 产生的 Handshake/1-RTT 密钥、其它算法和整包收发仍未接线；后续收到受保护包时，必须在 AEAD 认证通过后才更新包号空间状态。
+这两个函数接收**已经生成的五字节掩码**。Initial 包的 AES 掩码和 AES-GCM 载荷认证现由 `initial_keys.cc` 提供，推导与向量见 [initial-packet-protection.md](initial-packet-protection.md)。TLS 已产生 Handshake/1-RTT secret，其包密钥派生、其它算法和整包收发仍未接线；后续收到受保护包时，必须在 AEAD 认证通过后才更新包号空间状态。
 
 ## RFC 9002 §5、§6.2.1：RTT 估计和 PTO 时长
 
@@ -338,7 +340,7 @@ PTO（Probe Timeout）是“等待确认过久时，什么时候尝试发探测�
 | 规范范围 | 已有的可调用代码 | 必须继续实现的内容 |
 | --- | --- | --- |
 | RFC 9000 | 变长整数、包号数值编解码与三空间的基础发送/接收记录、部分 v1 受保护包头、单个 Initial 整包封装/解封、VN 构造与解析、Retry 字段解析、`0x00`–`0x1e` 核心帧线上格式与按包类型放置检查 | VN 接受逻辑、Retry 客户端状态机与发送、扩展帧、ACK/发送历史与接收区间保留策略、方向/角色与流量控制等帧语义、连接与迁移状态、UDP 数据报组装 |
-| RFC 9001 | Initial 密钥派生、AES-128-GCM 载荷认证、AES 报头掩码、样本位置与单个 Initial 整包保护；Retry 标签验证原语 | TLS 1.3 集成、Handshake/1-RTT 密钥、其它套件、连接层收发接线、密钥更新和丢弃 |
+| RFC 9001 | Initial 密钥派生、AES-128-GCM 载荷认证、AES 报头掩码、样本位置与单个 Initial 整包保护；Retry 标签验证原语；真实 TLS 1.3 握手、证书/ALPN/参数校验和 secret 回调 | Handshake/1-RTT secret 的包密钥派生与整包保护、其它套件、连接层收发接线、密钥更新和丢弃 |
 | RFC 9002 | RTT 估计、PTO 基础时长 | ACK 处理、发包记录、丢包判断、PTO 定时器与退避、拥塞控制及 ECN 验证 |
 
 这张表刻意区分“字节格式能解析”和“网络协议能工作”。例如 `AckFrame` 已能保存 `[4,5]` 和 `[8,10]`，但没有发包历史表就无法判断这些包是否真的发过，也无法释放 bytes-in-flight。`StreamFrame` 已能读出流 ID 和 FIN，但没有每流状态与流量控制，便不能把字节安全地交给应用。完整目标见 `requirements.md`；当前事实以源码、测试和 `coverage.md` 为准。
@@ -371,7 +373,7 @@ ctest --test-dir build --output-on-failure -j2
 
 代码实现时使用测试先行：先看见缺少接口、缺少 ACK 支持或空载荷缺陷使测试失败，再补实现。独立审查发现的 ACK 取样条件、ACK Delay 上限测试、62 位边界与短包头样本长度问题已修正。本次复核又发现 RTT 变动值与 RFC 9002 勘误的顺序不符：先将断言改为 40 ms，观察到 `quic_packet_primitives` 因得到旧结果 39.6875 ms 而失败；再调整实现顺序，定向测试恢复通过。各里程碑的任务与具体测试范围记录在 `docs/superpowers/plans/2026-10-19-quic-packet-primitives.md`、`2026-10-19-quic-basic-frames.md` 和 `2026-10-19-quic-packet-header.md`。
 
-以上 5/5 与 41/43 是历史记录；新增 CRYPTO 模块后的 QUIC 专项为 14/14（含编译夹具），当前复核记录见 `crypto-streams.md`。
+以上 5/5、41/43 及 CRYPTO 阶段 14/14 是历史记录；当前 TLS 阶段的专项与全量验证记录见 `tls-handshake.md`。
 
 ## 自测：能否用自己的话解释
 

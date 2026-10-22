@@ -50,3 +50,5 @@ ctest --test-dir build -R '^quic_' --output-on-failure -j2
 ```
 
 2026-10-21 验证记录：QUIC 专项 14/14（包含编译夹具）通过，ASan/UBSan 启用；独立审查发现的 discard 堆内存保留问题已按 RED→GREEN 修复并复核。全量回归在审查期间运行，49/52 通过；`net_interface`、`router` 因原有测试可执行文件缺失而未运行；原有 `wrapping_integers_roundtrip` 在约 495 秒仍未完成后被手动停止，不能称全量回归通过。修复后另行完成了全部 QUIC 专项。全量日志保留于 `build/quic-crypto-full-ctest.log`。
+
+TLS 接线进展：现已由 `quic/tls_handshake.*` 驱动真实 TLS 1.3，详见 [tls-handshake.md](tls-handshake.md)；本文中关于该原语自身不驱动 TLS 的说明仍成立。

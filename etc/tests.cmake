@@ -103,3 +103,5 @@ set_tests_properties(${compile_name_opt} PROPERTIES FIXTURES_SETUP compile_opt)
 
 stest(byte_stream_speed_test)
 stest(reassembler_speed_test)
+
+ttest(quic_tls_handshake)

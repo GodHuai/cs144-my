@@ -12,10 +12,12 @@ UDP I/O → 包解析/保护 → 连接/TLS → 帧调度与恢复 → 流/API�
 
 路径状态包含地址、验证、PMTU、ECN 与适用的 RTT/拥塞信息。迁移执行挑战/响应，更新连接 ID；按照 RFC 9000 §9.4 对新路径重置或保留拥塞/恢复状态，不能机械沿用旧路径估计。旧路径数据不能误验证新路径。连接状态机覆盖版本协商、Retry、握手确认、密钥丢弃、空闲、关闭、draining、stateless reset。
 
-TLS 使用成熟库，先验证 BoringSSL 的 QUIC callback、证书验证、会话恢复、密钥更新与构建许可证，再固定版本。QUIC 侧实现包保护、CRYPTO 重组和传输参数集成；不手写 TLS 或密码原语。0-RTT API 默认禁止应用数据，只有应用协议配置了可重放操作并明确请求才放行；互通适配层的 profile 只允许只读 HTTP/0.9 GET。拒绝时服务端不处理早期包，客户端重置所有流及关联应用状态并通知应用，仅由应用按重放安全策略发起新的 1-RTT 操作。服务端检查恢复配置并执行重放防护。
+TLS 使用 OpenSSL 3.5 external QUIC TLS 回调接口，当前固定 3.5.9；证书验证与握手已接入，会话恢复和密钥更新后续实现。QUIC 侧实现包保护、CRYPTO 重组和传输参数集成；不手写 TLS 或密码原语。0-RTT API 默认禁止应用数据，只有应用协议配置了可重放操作并明确请求才放行；互通适配层的 profile 只允许只读 HTTP/0.9 GET。拒绝时服务端不处理早期包，客户端重置所有流及关联应用状态并通知应用，仅由应用按重放安全策略发起新的 1-RTT 操作。服务端检查恢复配置并执行重放防护。
 
 当前 `UDPSocket` 和 `Address` 仅面向 IPv4，且 `recvfrom`/`sendto` 不携带 ECN 元数据。新增可表达 IPv4/IPv6 的地址和数据报类型，通过 `recvmsg`/`sendmsg` 及 IP_TOS/IPV6_TCLASS 等控制消息收发 ECN；先写回环探针，再接入 QUIC 路径/ECN 状态。
 
 验证采用编解码/状态单元测试、确定性虚拟网络、IPv4/IPv6 端到端、解析器模糊测试及 RFC 覆盖审计。独立实现互通采用 QUIC Interop Runner 约定的 HTTP/0.9 测试适配层、ALPN `hq-interop`、证书和文件传输格式；该适配层只服务测试。主要风险是 TLS/0-RTT、迁移路径状态、流量额度和跨包号空间恢复，每项独立设失败测试。
 
-参考：[RFC 9000](https://www.rfc-editor.org/rfc/rfc9000.html)、[RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html)、[RFC 9002](https://www.rfc-editor.org/rfc/rfc9002.html)、[BoringSSL QUIC API](https://boringssl.googlesource.com/boringssl/+/main/include/openssl/ssl.h)。
+参考：[RFC 9000](https://www.rfc-editor.org/rfc/rfc9000.html)、[RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html)、[RFC 9002](https://www.rfc-editor.org/rfc/rfc9002.html)、[OpenSSL external QUIC TLS API](https://docs.openssl.org/3.5/man3/SSL_set_quic_tls_cbs/)。
+
+2026-10-21 TLS 选型更新：采用 OpenSSL 3.5 的 external QUIC TLS 回调接口，固定 3.5.9 工作树内静态构建，替代早期 BoringSSL 探针候选。先启用 TLS_AES_128_GCM_SHA256，证书/主机名/ALPN 与传输参数均验证；恢复及 0-RTT 后续实现，当前明确关闭。见 `tls-handshake.md`。

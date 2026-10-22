@@ -18,7 +18,16 @@ include(etc/tests.cmake)
 include_directories("${PROJECT_SOURCE_DIR}/util")
 include_directories("${PROJECT_SOURCE_DIR}/src")
 
-find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
+find_package(OpenSSL 3.5 REQUIRED COMPONENTS SSL Crypto)
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_LIBRARIES OpenSSL::SSL OpenSSL::Crypto)
+check_cxx_source_compiles("#include <openssl/ssl.h>
+int main() { return SSL_set_quic_tls_cbs(nullptr, nullptr, nullptr); }"
+  QUIC_OPENSSL_EXTERNAL_TLS)
+unset(CMAKE_REQUIRED_LIBRARIES)
+if(NOT QUIC_OPENSSL_EXTERNAL_TLS)
+  message(FATAL_ERROR "OpenSSL external QUIC TLS API is required; see docs/quic-v1/tls-handshake.md")
+endif()
 
 add_subdirectory("${PROJECT_SOURCE_DIR}/util")
 add_subdirectory("${PROJECT_SOURCE_DIR}/src")

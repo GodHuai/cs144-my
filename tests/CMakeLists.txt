@@ -147,3 +147,19 @@ target_compile_options(quic_crypto_streams_sanitized PUBLIC ${SANITIZING_FLAGS})
 target_link_options(quic_crypto_streams_sanitized PUBLIC ${SANITIZING_FLAGS})
 target_link_libraries(quic_crypto_streams_sanitized quic_sanitized)
 add_dependencies(functionality_testing quic_crypto_streams_sanitized)
+
+find_program(QUIC_TEST_OPENSSL openssl REQUIRED)
+set(QUIC_TLS_CERT_DIR "${CMAKE_CURRENT_BINARY_DIR}/quic-tls-certificates")
+add_custom_target(quic_tls_certificates
+  COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/make_quic_tls_certificates.sh"
+               "${QUIC_TEST_OPENSSL}" "${QUIC_TLS_CERT_DIR}"
+  BYPRODUCTS "${QUIC_TLS_CERT_DIR}/server.pem" "${QUIC_TLS_CERT_DIR}/server.key"
+             "${QUIC_TLS_CERT_DIR}/other.pem" "${QUIC_TLS_CERT_DIR}/other.key"
+  DEPENDS make_quic_tls_certificates.sh VERBATIM)
+add_executable(quic_tls_handshake_sanitized EXCLUDE_FROM_ALL quic_tls_handshake.cc)
+target_compile_definitions(quic_tls_handshake_sanitized PRIVATE QUIC_TLS_TEST_CERT_DIR="${QUIC_TLS_CERT_DIR}")
+target_compile_options(quic_tls_handshake_sanitized PUBLIC ${SANITIZING_FLAGS})
+target_link_options(quic_tls_handshake_sanitized PUBLIC ${SANITIZING_FLAGS})
+target_link_libraries(quic_tls_handshake_sanitized quic_sanitized)
+add_dependencies(quic_tls_handshake_sanitized quic_tls_certificates)
+add_dependencies(functionality_testing quic_tls_handshake_sanitized)
