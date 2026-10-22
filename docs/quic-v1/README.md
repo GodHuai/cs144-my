@@ -19,6 +19,8 @@
    [handshake-connection.md](handshake-connection.md) 解释可复用连接引擎、实际 CID 绑定和握手状态。
    [udp.md](udp.md) 解释双栈非阻塞数据报、ECN 和真实回环加密握手。
    [crypto-streams.md](crypto-streams.md) 解释 TLS 字节的分级别重组、缓冲上限和重传分片。
+   [acknowledgments.md](acknowledgments.md) 手算 ACK 范围、区分已发送上界和活动包记录。
+   [loss-recovery.md](loss-recovery.md) 讲解 ACK 取样、阈值丢包、迟到确认和 PTO 事件循环。
 3. [coverage.md](coverage.md)：查某条规范现在有代码、有测试，还是尚未开始。
 4. [design.md](design.md) 与 [tasks.md](tasks.md)：完整连接的目标架构和后续工作顺序；它们是计划，不是当前实现证据。
 5. `docs/superpowers/specs/`、`docs/superpowers/plans/`：每一轮小功能的设计与测试记录。
@@ -43,10 +45,12 @@
 | 怎样将乱序 CRYPTO 帧还原为 TLS 字节，并保留重传数据？ | RFC 9000 §7.5、§19.6，RFC 9001 §4.1.3 | [crypto_streams.hh](../../quic/crypto_streams.hh)、[crypto_streams.cc](../../quic/crypto_streams.cc) | [quic_crypto_streams.cc](../../tests/quic_crypto_streams.cc) |
 | TLS 怎样验证身份并交出 Handshake/1-RTT secret？ | RFC 9001 §4、§8 | [tls_handshake.hh](../../quic/tls_handshake.hh)、[tls_handshake.cc](../../quic/tls_handshake.cc) | [quic_tls_handshake.cc](../../tests/quic_tls_handshake.cc) |
 | TLS secret 如何保护 Handshake/1-RTT 整包？ | RFC 9001 §5.1、§5.3–5.5 | [packet_keys.hh](../../quic/packet_keys.hh)、[protected_packet.cc](../../quic/protected_packet.cc) | [quic_protected_packet.cc](../../tests/quic_protected_packet.cc) |
-| 收到 ACK 后如何更新 RTT 和 PTO？ | RFC 9002 §5–6 | [rtt_estimator.hh](../../quic/rtt_estimator.hh)、[rtt_estimator.cc](../../quic/rtt_estimator.cc) | [quic_packet_primitives.cc](../../tests/quic_packet_primitives.cc) |
+| 收到 ACK 后如何更新 RTT 和 PTO？ | RFC 9002 §5–6 | [rtt_estimator.hh](../../quic/rtt_estimator.hh)、[rtt_estimator.cc](../../quic/rtt_estimator.cc)、[packet_recovery.cc](../../quic/packet_recovery.cc) | [quic_packet_primitives.cc](../../tests/quic_packet_primitives.cc)、[quic_packet_recovery.cc](../../tests/quic_packet_recovery.cc) |
+| 如何生成即时 ACK 并拒绝对未发送包的确认？ | RFC 9000 §13、§19.3 | [acknowledgments.cc](../../quic/acknowledgments.cc) | [quic_acknowledgments.cc](../../tests/quic_acknowledgments.cc) |
+| 如何将握手、ACK、恢复与 UDP 接在一起？ | RFC 9000 §5–8、RFC 9002 §5–6 | [handshake_connection.cc](../../quic/handshake_connection.cc)、[udp_socket.cc](../../quic/udp_socket.cc) | [quic_handshake_connection.cc](../../tests/quic_handshake_connection.cc)、[quic_udp_handshake.cc](../../tests/quic_udp_handshake.cc) |
 
 ## 一句话检查当前边界
 
-已有 QUIC v1 基础编解码、Initial/Handshake/1-RTT 单包保护、分级别 CRYPTO 字节流和真实 TLS 1.3 双端握手；内存测试已贯通受保护握手和双向 1-RTT 数据；新增双栈 UDP/ECN 接口，真实回环测试已贯通加密握手和 1-RTT 控制帧；新增可复用握手连接引擎，管理实际 CID、包号、反放大、乱序密文、确认和握手密钥丢弃。新增即时 ACK 和有界发送记录，见 [acknowledgments.md](acknowledgments.md)。新增握手丢包恢复、RTT 与 PTO 接线，见 [loss-recovery.md](loss-recovery.md)。**尚无具备拥塞控制和可靠应用流的完整 QUIC 连接**。缺失内容和逐项状态以 [coverage.md](coverage.md) 为准。
+代码基准 `7abc5c7`（2026-10-22）：基础编解码、AES 包保护、真实 TLS 1.3、单路径握手连接、双栈 UDP、即时 ACK、有界握手恢复、RTT 与 PTO 已贯通。**可靠应用流、流量控制、拥塞控制和第三方互通仍未完成。** 当前缺口见 [coverage.md](coverage.md)，最近测试记录为 QUIC 21/21、全量 52/59，详见 [loss-recovery.md](loss-recovery.md)。文档中的较早测试数字只代表相应历史里程碑。
 
 构建需要带 external QUIC TLS API 的 OpenSSL ≥3.5（SSL/Crypto）；固定版本和工作树内构建方法见 [tls-handshake.md](tls-handshake.md)。

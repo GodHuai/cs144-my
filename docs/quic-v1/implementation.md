@@ -1,31 +1,27 @@
 # QUIC v1 实现讲解（进行中）
 
-新增 `quic/packet_keys.hh` 与 `protected_packet.hh/.cc`：共用已有密码后端，从 TLS traffic secret 派生 Handshake/1-RTT 包密钥，完成长/短报头整包封装和认证解封；内存测试已贯通受保护的真实 TLS 握手和双向 1-RTT STREAM 字节。详见 [protected-packets.md](protected-packets.md)。
+代码基准 `7abc5c7`（2026-10-22）。目前基础编码、包保护、CRYPTO/TLS、双栈 UDP 和单路径 `HandshakeConnection` 已贯通；即时 ACK、发送时间、RTT、阈值丢包和有界握手 PTO 已接入连接。**可靠应用流、流量控制、拥塞控制与第三方互通仍未完成。**
 
-新增 `quic/tls_handshake.hh/.cc`：通过 OpenSSL 3.5 external QUIC TLS API 完成真实 TLS 1.3 握手，验证 CA、主机名、ALPN 和传输参数，独立维护读写级别及 traffic secret。构建方法、接口和边界见 [tls-handshake.md](tls-handshake.md)。
-
-新增 CRYPTO 收发字节流 `quic/crypto_streams.hh/.cc`：分别维护 Initial、Handshake、1-RTT 的乱序重组、容量和发送 offset；现有 Initial 包保护集成测试覆盖丢失、重复、乱序和篡改。详细接口、错误和边界见 [crypto-streams.md](crypto-streams.md)。它现已通过 `TlsHandshake` 接入 TLS。
-
-新增单个 Initial 包的封装和认证解封原语 `quic/initial_packet.hh/.cc`：它将下述包头、Initial AES-GCM、报头保护和包号恢复按规范顺序组合。完整流程、RFC 附录 A.3 整包向量和边界见 [initial-packet.md](initial-packet.md)。这仍是脱离连接状态机与 UDP 的单包功能。
-
-当前完成 RFC 9000 §16 的变长整数、§17.1 的包号编解码、§12.3 的部分包号空间状态、§17.2–17.3 的部分包头布局（包括版本协商和 Retry 的字段解析）、§18 的传输参数编解码与静态校验、§8.2 的单路径验证状态、§8/§9.3.1 的反放大额度记账、§5.1/§9.5 的对端连接 ID 池、§5.1.1/§19.16 的本端连接 ID 签发与退休状态、§19.1–19.20 的**核心帧线上格式**编解码、RFC 9001 §5.2–5.4 的 Initial 密钥、AES-GCM 载荷和 AES 报头保护基础操作、§5.8 的 Retry 完整性标签，以及 RFC 9002 §5 的 RTT 估计和 §6.2.1 的 PTO 时长计算。它们还没有组成 QUIC 连接；生产连接/UDP 接线、Retry 状态机、版本协商处理、ACK 与丢包状态机、UDP 互通仍未完成。扩展帧及逐帧语义也尚未处理。最终以完整协议代码、测试和 `coverage.md` 为准。
+基础工具按下面的手算顺序阅读。整包与状态机专题依次见 [Initial 保护](initial-packet-protection.md)、[Initial 整包](initial-packet.md)、[CRYPTO](crypto-streams.md)、[TLS](tls-handshake.md)、[Handshake/1-RTT 包](protected-packets.md)、[UDP](udp.md)、[连接引擎](handshake-connection.md)、[ACK](acknowledgments.md)、[丢包恢复](loss-recovery.md)。独立的路径/CID/Retry 原语并不表示对应迁移和协商状态机已经接线。
 
 这份笔记按初学者能逐步手算的顺序编写：每节先说 RFC 规定什么，再解释为什么，最后回到当前 C++ 源码。笔记中的代码片段只摘取决定行为的语句；完整可编译代码以相应 `quic/*.hh`、`quic/*.cc` 和 `tests/quic_*.cc` 为准，避免复制一份会随实现变化而失真的源码。
 
 ## 先建立整体图景
 
-QUIC 运行在 UDP 之上。UDP 只负责把一个数据报送到对端；QUIC 在数据报里放包，在包里放帧。一个数据报可以包含多个**长包头**包。收到数据后，理论上的处理顺序如下，`待实现` 的步骤在当前分支尚不能执行：
+QUIC 运行在 UDP 之上。UDP 只负责把一个数据报送到对端；QUIC 在数据报里放包，在包里放帧。一个数据报可以包含多个**长包头**包。当前单路径连接按以下流程接收；缺密钥时先有界保存密文，待新密钥可用再重试：
 
 ```mermaid
 flowchart LR
-  A[UDP 数据报<br/>待接入] --> B[定位包边界与 pn_offset<br/>packet_header.cc]
-  B --> C[生成报头掩码<br/>待实现]
-  C --> D[移除掩码并恢复完整包号<br/>header_protection.cc + packet_number.cc]
-  D --> E[AEAD 认证与解密<br/>待实现]
-  E --> F[检查包号是否已处理<br/>packet_number_space.cc]
-  F --> G[解析帧<br/>frame.cc]
-  G --> H[更新 ACK、流和连接状态<br/>待实现]
+  A[UDP 数据报与路由检查] --> B[定位包边界与 pn_offset]
+  B --> C[移除报头掩码与恢复包号]
+  C --> D[AEAD 认证与解密]
+  D --> E[去重与完整帧/ACK 预检]
+  E --> F[CRYPTO 重组并驱动 TLS]
+  E --> G[ACK 更新恢复状态]
+  E --> H[确认与关闭状态]
 ```
+
+认证失败静默丢弃，认证重复包不重新交付 CRYPTO，但可重新触发 ACK。当前没有应用 STREAM 处理器。
 
 `packet number`（包号）给每个受保护包一个号码；`stream offset`（流偏移）标记字节在一条流中的位置。它们不是同一种序号。`pn_offset` 是**数据报内的字节位置**，不是包号。`ACK Delay` 是对端发送 ACK 前有意等待的时间，线上字段还需要依据对端参数换算。源码里的 `std::nullopt` 通常表示输入还不足或格式不支持；抛出的异常多用于调用方要求编码一个不合法值。
 
@@ -44,7 +40,7 @@ flowchart LR
 | `decode_frames` / `encode_frame` | 解码输入应来自已认证的包载荷 | 得帧列表或单帧字节；截断/不支持得 `nullopt`，非法编码请求抛异常 |
 | `decode_transport_parameters` / `encode_transport_parameters` / `validate_transport_parameters` | TLS 扩展原始字节；角色验证须提供实际 Initial/Retry 包头里的 CID | 解码拒绝重复/非法值，编码拒绝非法本地值，角色验证返回 `bool`；已由 `TlsHandshake` 接入 TLS 扩展 |
 | `PathValidation::start` / `record_sent_challenge` / `on_response` / `expire` | 每条候选路径一个实例；挑战值由安全随机源生成；仅记录实际发送的探测与认证成功的回应 | 返回验证阶段，区分地址可达与 1200 字节 MTU；未接入 UDP 或迁移决策 |
-| `AntiAmplificationBudget::record_received` / `record_sent` / `validate_address` | 每个对端地址一个实例；构造时标记发起者或回应者；输入为能唯一归属连接的整个 UDP 载荷字节数 | 回应未验证地址时最多发送接收量的三倍；客户端 Initial 和主动迁移不受该规则限制；尚无 UDP 归属和发送失败回滚接线 |
+| `AntiAmplificationBudget::record_received` / `record_sent` / `validate_address` | 每个对端地址一个实例；构造时标记发起者或回应者；输入为能唯一归属连接的整个 UDP 载荷字节数 | 回应未验证地址时最多发送接收量的三倍；客户端 Initial 和主动迁移不受该规则限制；已由固定对端连接按完整数据报记账；poll_transmit 交付即扣额度，UDP EAGAIN 须保留原数据报 |
 | `PeerConnectionIds::on_new_id` / `select_for_path` / `retire_path` / `pending_retirements` | 输入来自已认证的包；路径键由连接层提供唯一的本地/远端地址对 | 跟踪对端签发的 CID、退休门槛、路径绑定、旧路径主动退休与资源限额；尚无发送帧、路由和生命周期接线 |
 | `LocalConnectionIds::issue` / `on_retire` / `lookup` | CID/token 由上层安全随机生成；退休帧来自已认证的包，须传入承载包的真实 DCID | 连续签发本端 CID，检查退休序号和包 DCID，移除活动 ID；尚无 UDP 分发路由和自动补发 |
 | `header_protection_sample` / `apply_header_mask` / `remove_header_mask` | 输入是**单个包**，`pn_offset` 相对包开头；mask 已生成 | 得 16 字节样本；掩码函数以 `bool` 表示能否完整修改 |
@@ -129,9 +125,9 @@ RFC 将 Initial、Handshake、Application Data 分成三个包号空间。每个
 
 为什么函数叫 `record_authenticated`？它**不能验证 AEAD**。调用者必须先移除报头保护、恢复完整包号并成功进行 AEAD 验证，再用它检查是否重复；恶意者伪造但验证失败的包不能推进最大包号，更不能占用接收区间。返回 false 表示重复、低于丢弃下限或超过 62 位上限，调用方应丢弃，不能把同一帧再交给应用。[RFC 9000 §12.3](https://www.rfc-editor.org/rfc/rfc9000.html#section-12.3)
 
-保存一生收到的每个不连续包号会耗尽内存，所以 `retire_received_below(kind, minimum)` 可以单调提高下限并裁剪旧区间。比如已有 `[3,5]`，把下限设为 4 后只保留 `[4,5]`；包号 3 随后抵达会被丢弃。它不会把 `largest_received` 降回去。规范提醒下限选择要考虑较大 RTT 和迁移路径上的迟到包；当前**没有** RTT 驱动的自动清理策略，未来连接层必须调用此接口并决定何时安全地提高下限。若连接长期不清理、对端持续发送稀疏包号，区间仍可能增长；这个类不能单独作为抗资源耗尽保证。[RFC 9000 §12.3](https://www.rfc-editor.org/rfc/rfc9000.html#section-12.3)
+保存一生收到的每个不连续包号会耗尽内存，所以 `retire_received_below(kind, minimum)` 可以单调提高下限并裁剪旧区间。比如已有 `[3,5]`，把下限设为 4 后只保留 `[4,5]`；包号 3 随后抵达会被丢弃。它不会把 `largest_received` 降回去。当前连接已调用此接口保留最近 4096 个包号位置的窗口；这不是 RTT 驱动的保留策略，也不能把这个基础类单独当作抗资源耗尽保证。迁移和更迟到包的策略仍待完善。[RFC 9000 §12.3](https://www.rfc-editor.org/rfc/rfc9000.html#section-12.3)
 
-测试分别验证三个空间的发送编号、0-RTT/1-RTT 共用、乱序后合并与去重、下限不倒退、`2^62−1` 接收边界，以及无效包类型。此处没有实现 ACK 区间生成或发包历史表；收到并记录一个包号也不等于可以立即发 ACK，ACK 发送时机与被确认包所在空间需要单独实现。
+测试分别验证三个空间的发送编号、0-RTT/1-RTT 共用、乱序后合并与去重、下限不倒退、`2^62−1` 接收边界，以及无效包类型。ACK 区间生成和发包历史分别由 `acknowledgments.*`、`packet_recovery.*` 实现；收到并记录一个包号不等于可以立即发 ACK，仍须遵守触发策略和空间限制。
 
 ## RFC 9000 §17.2–17.3：受保护包头的布局
 
@@ -177,7 +173,7 @@ layout.packet_end = cursor + static_cast<size_t>( *length );
 
 `build_version_negotiation(dcid, scid, versions)` 默认把 unused 的 `0x40` 位置 1，符合规范对与其他协议复用时的建议；调用者也能指定完整的七位 unused 值。`parse_version_negotiation(datagram)` 则接受该位为 0 或 1，检查版本为零、两个连接 ID 的长度不越界，以及末尾有完整的四字节版本项。它返回字段内容，不改变连接状态。假设收到的请求包是 `SCID=xy, DCID=z`，服务器回复时应使用 `DCID=xy, SCID=z`；代码中的构造函数按**回复**字段收参数，连接层将来必须负责交换原请求的 ID。
 
-一个容易踩的坑：普通 v1 长包头的连接 ID 最多 20 字节，VN 却不属于某个具体版本，其长度字段可表示最多 255 字节。服务器面对未来版本时不能用 v1 的 20 字节限制决定能否构造 VN；所以 VN 读写独立采用 8 位长度界限。测试用 21 字节 ID 验证这一点。解析出的版本列表并不能直接决定是否切换版本。仅支持 v1 的客户端若已成功处理其他包，或列表仍包含它最初选择的 v1，必须丢弃 VN；否则应放弃当前连接尝试。当前没有连接状态机来执行这些条件。[RFC 9000 §6.2](https://www.rfc-editor.org/rfc/rfc9000.html#section-6.2)
+一个容易踩的坑：普通 v1 长包头的连接 ID 最多 20 字节，VN 却不属于某个具体版本，其长度字段可表示最多 255 字节。服务器面对未来版本时不能用 v1 的 20 字节限制决定能否构造 VN；所以 VN 读写独立采用 8 位长度界限。测试用 21 字节 ID 验证这一点。解析出的版本列表并不能直接决定是否切换版本。仅支持 v1 的客户端若已成功处理其他包，或列表仍包含它最初选择的 v1，必须丢弃 VN；否则应放弃当前连接尝试。当前单路径握手引擎不处理 VN，尚无对应接受状态机。[RFC 9000 §6.2](https://www.rfc-editor.org/rfc/rfc9000.html#section-6.2)
 
 ### RFC 9000 §17.2.5：Retry 的字段和安全边界
 
@@ -260,7 +256,7 @@ ack.ranges.push_back( AckRange { range_largest - *length, range_largest } );
 
 `PATH_CHALLENGE` (`1a`) 与 `PATH_RESPONSE` (`1b`) 各带**恰好八字节**不透明数据。解析器只读出这八字节；未来收到挑战时，连接层要用同样的数据回复，并结合发送路径判断验证是否成功。`HANDSHAKE_DONE` (`1e`) 没有字段，只有服务端在完成握手后可发送；仅解析出它并不意味着可以提前确认握手。[RFC 9000 §19.17–19.20](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.17)
 
-`CONNECTION_CLOSE` 有两种**不同布局**：传输错误 `1c` 是“错误码、触发它的帧类型、原因长度、原因字节”；应用错误 `1d` 删去“触发帧类型”。例如 `1c 0a 08 03 62 61 64` 表示传输错误码 10、触发帧类型 8、三字节原因 `bad`。`1d 25 00` 表示应用错误码 37、空原因。源码用 `frame_type` 是否存在与 `application` 标志相互校验，防止编码出错位的字段；解码时以线上类型决定是否读取该字段。原因长度按**字节数**计算，可以为零，规范建议原因文本使用 UTF-8，但本层只保留字节，尚未实现文字验证或关闭状态机。[RFC 9000 §19.19](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.19)
+`CONNECTION_CLOSE` 有两种**不同布局**：传输错误 `1c` 是“错误码、触发它的帧类型、原因长度、原因字节”；应用错误 `1d` 删去“触发帧类型”。例如 `1c 0a 08 03 62 61 64` 表示传输错误码 10、触发帧类型 8、三字节原因 `bad`。`1d 25 00` 表示应用错误码 37、空原因。源码用 `frame_type` 是否存在与 `application` 标志相互校验，防止编码出错位的字段；解码时以线上类型决定是否读取该字段。原因长度按**字节数**计算，可以为零，规范建议原因文本使用 UTF-8，但本层只保留字节，尚未实现文字验证；连接已有对端关闭进入 Draining 的处理，但完整关闭计时及主动错误关闭仍缺失。[RFC 9000 §19.19](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.19)
 
 解析器对 CID、路径数据和重置令牌使用“先确认剩余长度，再读取固定字节数”的做法；对令牌与原因使用显式长度与 `read_data()`。如果完整明文载荷中任何一帧截断，就返回 `std::nullopt`，避免把前面已读出的帧误交给连接层。测试包含合法相邻帧、空令牌、CID 长度 0 或 21、退休阈值倒置、重置令牌缺字节、路径数据缺字节，以及两种关闭帧原因截断。
 
@@ -307,7 +303,7 @@ for ( size_t i = 0; i < pn_length; ++i )
 
 异或同一个 mask 两次能恢复原值，但发送和接收不能简单调用同一个步骤顺序，因为接收端一开始不知道正确的包号长度。`remove_header_mask()` 在检查字段足够长后才修改报文；这一点防止畸形短包留下“首字节已改、包号还没改”的半修改状态。
 
-这两个函数接收**已经生成的五字节掩码**。Initial 包的 AES 掩码和 AES-GCM 载荷认证现由 `initial_keys.cc` 提供，推导与向量见 [initial-packet-protection.md](initial-packet-protection.md)。TLS 的 Handshake/1-RTT secret 已通过 `protected_packet.*` 接入 AES 整包保护；其它算法及生产连接收发仍未接线；后续收到受保护包时，必须在 AEAD 认证通过后才更新包号空间状态。
+这两个函数接收**已经生成的五字节掩码**。Initial 包的 AES 掩码和 AES-GCM 载荷认证现由 `initial_keys.cc` 提供，推导与向量见 [initial-packet-protection.md](initial-packet-protection.md)。TLS 的 Handshake/1-RTT secret 已通过 `protected_packet.*` 接入 AES 整包保护；单路径连接已接线，其它算法尚缺；连接只在 AEAD 认证通过后更新包号空间状态。
 
 ## RFC 9002 §5、§6.2.1：RTT 估计和 PTO 时长
 
@@ -333,32 +329,32 @@ smoothed_rtt_ms_ = 0.875 * smoothed_rtt_ms_ + 0.125 * adjusted_rtt;
 
 PTO（Probe Timeout）是“等待确认过久时，什么时候尝试发探测包”的时长基础，不等于完整定时器。初始化值手算为 `333 + max(4×166.5, 1) = 999 ms`。在应用数据空间，握手确认后还要加上 `max_ack_delay`；Initial/Handshake 不加。`pto_ms()` 只给出基础时长，真正的定时器还必须考虑是否有引发 ACK 的包在途、包号空间、指数退避、反放大等。[RFC 9002 §6.2.1](https://www.rfc-editor.org/rfc/rfc9002.html#section-6.2.1)
 
-调用者必须确保 ACK 帧中的 Largest Acknowledged 包是新确认的，且这次 ACK 至少新确认了一个会引发 ACK 的包，才调用 `observe()`。RTT 样本取自 Largest Acknowledged 包的发送时间；这个包本身可以不引发 ACK。该 ACK 处理器尚未实现。这里也没有实现 PTO 定时器、指数退避、包号空间选择或丢包判定。测试覆盖首次样本、ACK delay 上下限、未确认握手的应用 PTO、路径重置和非法输入。
+调用者必须确保 ACK 帧中的 Largest Acknowledged 包是新确认的，且这次 ACK 至少新确认了一个会引发 ACK 的包，才调用 `observe()`。RTT 样本取自 Largest Acknowledged 包的发送时间；这个包本身可以不引发 ACK。`PacketRecovery::acknowledged()` 已执行该筛选；恢复模块也已接入 PTO 定时器、指数退避、空间选择及丢包阈值，详见 [loss-recovery.md](loss-recovery.md)。测试覆盖首次样本、ACK delay 上下限、未确认握手的应用 PTO、路径重置和非法输入。
 
-`observe()` 接收的时间单位是**毫秒**，而 ACK 帧保存的是尚未按对端 `ack_delay_exponent` 换算的线上整数。未来 ACK 处理器必须先完成指数和微秒到毫秒的转换，再把合法样本传给估计器；直接把 `AckFrame::ack_delay` 当毫秒会产生错误的 RTT。
+`observe()` 接收的时间单位是**毫秒**，而 ACK 帧保存的是尚未按对端 `ack_delay_exponent` 换算的线上整数。`PacketRecovery::acknowledged()` 已完成指数和微秒到毫秒的转换，再把合法样本传给估计器；直接把 `AckFrame::ack_delay` 当毫秒会产生错误的 RTT。
 
 ## 从这些模块到真正的 QUIC 连接，还差什么
 
 | 规范范围 | 已有的可调用代码 | 必须继续实现的内容 |
 | --- | --- | --- |
-| RFC 9000 | 变长整数、包号数值编解码与三空间的基础发送/接收记录、部分 v1 受保护包头、单个 Initial 整包封装/解封、VN 构造与解析、Retry 字段解析、`0x00`–`0x1e` 核心帧线上格式与按包类型放置检查 | VN 接受逻辑、Retry 客户端状态机与发送、扩展帧、ACK/发送历史与接收区间保留策略、方向/角色与流量控制等帧语义、连接与迁移状态、UDP 数据报组装 |
-| RFC 9001 | Initial 密钥派生、AES-128-GCM 载荷认证、AES 报头掩码、样本位置与单个 Initial 整包保护；Retry 标签验证原语；真实 TLS 1.3 握手、证书/ALPN/参数校验和 secret 回调；Handshake/1-RTT AES 整包保护及内存 TLS 数据路径 | 其它套件、连接层收发接线、密钥更新和丢弃 |
-| RFC 9002 | RTT 估计、PTO 基础时长 | ACK 处理、发包记录、丢包判断、PTO 定时器与退避、拥塞控制及 ECN 验证 |
+| RFC 9000 | 基础编码、核心帧格式、参数/CID 校验、单路径连接、真实双栈 UDP、即时 ACK、有界发送与接收窗口 | 应用流及流量控制、完整角色/方向语义、VN/Retry 接受、迁移、动态路由、PMTU、关闭/空闲计时 |
+| RFC 9001 | Initial/Handshake/1-RTT AES 包保护、CRYPTO、真实 TLS 1.3、证书/ALPN、实际 CID 绑定、握手确认及密钥丢弃 | 其它套件、后握手 TLS、密钥更新/使用上限、会话恢复和 0-RTT |
+| RFC 9002 | 发送时间、ACK 样本筛选、RTT、包号/时间阈值、握手 PTO/退避、迟到 ACK 与共享逻辑帧身份 | 应用流恢复、CRYPTO 发送缓冲按 ACK 回收、拥塞控制、bytes-in-flight、pacing、ECN 验证 |
 
-这张表刻意区分“字节格式能解析”和“网络协议能工作”。例如 `AckFrame` 已能保存 `[4,5]` 和 `[8,10]`，但没有发包历史表就无法判断这些包是否真的发过，也无法释放 bytes-in-flight。`StreamFrame` 已能读出流 ID 和 FIN，但没有每流状态与流量控制，便不能把字节安全地交给应用。完整目标见 `requirements.md`；当前事实以源码、测试和 `coverage.md` 为准。
+例如 ACK 现在会对实际已交付包号预检并更新发送历史，但尚无 bytes-in-flight 或拥塞窗口。STREAM 仍只具备线上格式编解码，没有应用字节交付和额度约束。完整目标见 `requirements.md`；当前事实以源码、测试和 `coverage.md` 为准。
 
 ## 验证记录与可复现命令
 
-### 历史逐模块复核
+### 逐模块检查范围
 
 | 模块 | 对照规范与检查重点 | 结论范围 |
 | --- | --- | --- |
 | `varint` | RFC 9000 §16、附录 A.1；长度边界、非最短编码与截断 | 现有实现和测试中的行为与对照规则一致 |
-| `packet_number` / `packet_number_space` | RFC 9000 §12.3、§17.1、附录 A.2/A.3；半窗口、三空间映射、乱序去重与 62 位上限 | 数值接口与基础收发状态已实现；自动记录清理、ACK 及密钥状态尚不存在 |
+| `packet_number` / `packet_number_space` | RFC 9000 §12.3、§17.1、附录 A.2/A.3；半窗口、三空间映射、乱序去重与 62 位上限 | 三空间收发和有界去重已实现；连接已接入 ACK 和密钥退役清理 |
 | `packet_header` / `retry_integrity` | RFC 9000 §17.2–17.3、RFC 9001 §5.4、§5.8；v1 包型、CID、Length、样本与 Retry 标签 | 已实现受保护包头布局、VN 线上格式、Retry 字段解析与标签验证原语；客户端接受规则和 Retry 状态机尚未实现 |
-| `frame` | RFC 9000 §12.4–12.5、§19.1–19.20；长度、ACK gap、流终点、包类型限制和本地数值界限 | 核心帧线上字段与按包类型放置规则已实现；角色、方向、包号空间内容及连接语义未实现 |
-| `header_protection` / `initial_packet` | RFC 9001 §5.3–5.4、附录 A.3；样本位置、首字节掩码宽度、整包收发顺序 | 基础操作及单个 Initial 整包已对照 RFC 向量；其它套件和连接层收发接线未实现 |
-| `rtt_estimator` | RFC 9002 §5.3、§6.2.1 与勘误 7539；ACK Delay、更新顺序、PTO | 修正一处变动值更新顺序；ACK 处理与定时器未实现 |
+| `frame` | RFC 9000 §12.4–12.5、§19.1–19.20；长度、ACK gap、流终点、包类型限制和本地数值界限 | 核心帧线上字段与按包类型放置规则已实现；连接已支持握手/ACK/关闭子集；应用流及其它角色、方向和连接语义仍待完成 |
+| `header_protection` / `initial_packet` | RFC 9001 §5.3–5.4、附录 A.3；样本位置、首字节掩码宽度、整包收发顺序 | 基础操作及单个 Initial 整包已对照 RFC 向量；单路径连接收发已接线，其它套件未实现 |
+| `rtt_estimator` | RFC 9002 §5.3、§6.2.1 与勘误 7539；ACK Delay、更新顺序、PTO | 修正一处变动值更新顺序；恢复模块已接入 ACK 取样和定时器，未实现完整拥塞控制 |
 
 这里的“与对照规则一致”仅指表中列出的基础函数及检查过的输入，不代表完整 RFC 一致性或网络互通。独立审阅没有找到其他能复现的基础函数协议错误。还有一个重要接口约定：`PacketLayout::pn_offset` 是**整个数据报**的下标，而报头掩码函数用 `packet[0]` 当作当前包首字节。处理拼接包时，应先切出 `datagram.substr(packet_start, packet_end - packet_start)`，再将 `pn_offset` 换为 `pn_offset - packet_start`；直接传整个数据报会改错首字节。
 
@@ -366,34 +362,31 @@ PTO（Probe Timeout）是“等待确认过久时，什么时候尝试发探测�
 
 ```sh
 cd /home/huai/minnow-quic-proposal
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-ctest --test-dir build -R '^quic_' --output-on-failure
-ctest --test-dir build --output-on-failure -j2
+# 沿用已配置的 OpenSSL 3.5.9 构建；首次配置方法见 tls-handshake.md。
+ctest --test-dir build -R '^quic_' --output-on-failure --timeout 30
+ctest --test-dir build --output-on-failure --timeout 30 -j2
 ```
 
-补全核心帧并格式化后，QUIC 定向测试（含公共编译夹具）为 **5/5 通过**。同一源码下、无额外 12 秒超时限制的全量 CTest **43 项中 41 项通过**；`net_interface` 与 `router` 因缺少相应的测试可执行文件而未运行，因此全量测试命令退出状态为 8。这组数字是运行记录，不会随着文档编辑自动更新。
+**早期历史记录：**补全核心帧并格式化后，QUIC 定向测试（含公共编译夹具）为 **5/5 通过**。同一源码下、无额外 12 秒超时限制的全量 CTest **43 项中 41 项通过**；`net_interface` 与 `router` 因缺少相应的测试可执行文件而未运行，因此全量测试命令退出状态为 8。这组数字是运行记录，不会随着文档编辑自动更新。
 
 代码实现时使用测试先行：先看见缺少接口、缺少 ACK 支持或空载荷缺陷使测试失败，再补实现。独立审查发现的 ACK 取样条件、ACK Delay 上限测试、62 位边界与短包头样本长度问题已修正。本次复核又发现 RTT 变动值与 RFC 9002 勘误的顺序不符：先将断言改为 40 ms，观察到 `quic_packet_primitives` 因得到旧结果 39.6875 ms 而失败；再调整实现顺序，定向测试恢复通过。各里程碑的任务与具体测试范围记录在 `docs/superpowers/plans/2026-10-19-quic-packet-primitives.md`、`2026-10-19-quic-basic-frames.md` 和 `2026-10-19-quic-packet-header.md`。
 
-以上 5/5、41/43 及 CRYPTO 阶段 14/14 是历史记录；TLS 阶段记录见 `tls-handshake.md`；新增整包保护后的专项和全量验证记录见 `protected-packets.md`。
+以上 5/5、41/43 及 CRYPTO 阶段 14/14 是历史记录。最新代码基准 `7abc5c7` 的 QUIC CTest 为 **21/21**，全量为 **52/59**；五项既有超时和两个缺失可执行文件详见 [loss-recovery.md](loss-recovery.md)。本次仅整理文档，没有重新运行 CTest。
 
 ## 自测：能否用自己的话解释
 
 1. `40 25` 为什么能解为 37，而 `40 01` 不能作为 PING 的帧类型？答：一般 QUIC 变长整数允许非最短形式；帧类型必须用最短形式，PING 应直接编码为单字节 `01`。
 2. `pn_offset` 后面只有 19 字节时为什么拒绝？答：报头保护样本必须从 `pn_offset + 4` 开始连续取 16 字节，合计至少 20 字节。
-3. 为什么 ACK 的线上值 3 不能直接传给 `observe()` 作为 3 ms？答：它先要按对端 `ack_delay_exponent` 转成微秒，再转换成估计器使用的毫秒；当前代码缺少这层处理。
+3. 为什么 ACK 的线上值 3 不能直接传给 `observe()` 作为 3 ms？答：它先要按对端 `ack_delay_exponent` 转成微秒，再转换成估计器使用的毫秒；当前由 PacketRecovery 完成这层转换。
 4. 为什么一个 STREAM 帧带 FIN 不代表 UDP 数据报到此结束？答：FIN 是该**流**的最终大小标记；只有缺少 LEN 位的 STREAM 才占满当前包载荷的剩余部分。
 
-## UDP 收发的新进展
+## 沿调用链阅读 ACK 与恢复
 
-`quic/udp_socket.*` 已提供 Linux IPv4/IPv6 非阻塞收发和逐包 ECN；`tests/quic_udp_handshake.cc` 通过真实回环 UDP 贯通 TLS/包保护与 1-RTT 控制帧。详细接口、错误处置、反放大和测试驱动边界见 [udp.md](udp.md)。该驱动没有成为生产连接状态机；前文完整连接的待办仍然适用。
+1. 从 `HandshakeConnection::receive()` 进入认证、去重与整包预检；ACK 先对实际已交付包号验证，再改变状态。
+2. `PacketAcknowledgments` 保存接收区间和活动包号；`PacketRecovery::acknowledged()` 根据近期发送时间筛选 RTT、标记共享逻辑帧已交付，并检测更小包号的丢失。
+3. `next_timeout_us()` 返回单调微秒绝对期限，`on_timeout()` 只在当前选定期限到达后处理；有丢失期限时优先于 PTO。
+4. `poll_transmit()` 重新保护待发送帧并分配新包号；恢复 CRYPTO 保留原 offset/data，不重复推进 TLS 新数据游标。交付时才记录发送时间和反放大扣账，EAGAIN 时外部保存原数据报。
 
-## 可复用握手连接
+包号阈值为 3，时间阈值为 `max(1ms, 9/8 × max(latest_rtt, smoothed_rtt))`，均针对比最大已确认包号小的未确认包。PTO 初值 999ms，按全连接指数退避，到期探测不等于宣告所有包丢失。迟到 ACK 可通过近期元数据找到原包及重发副本共享的逻辑交付身份，取消冗余重发；历史淘汰后不保证仍能关联。
 
-`HandshakeConnection` 已将握手编排移入库：真实 Initial CID 绑定 TLS 参数、认证后完整帧预检、三空间去重、乱序密文缓冲、反放大暂停恢复、双方确认和握手密钥丢弃。接口和仍缺少的可靠传输/流/关闭语义见 [handshake-connection.md](handshake-connection.md)。它尚不是完整 QUIC 连接。
-
-
-ACK 里程碑：即时确认、分空间的有界发送记录与认证重复包重新确认已接入连接，见 [acknowledgments.md](acknowledgments.md)。前文关于 ACK 完全缺失的历史描述已由此替代；RTT 接线、丢包恢复、PTO 和拥塞控制仍待实现。
-
-
-2026-10-22 恢复阶段：新增 `PacketRecovery` 和连接超时 API，接入发送时间、RTT、包号/时间阈值与 PTO，用新包号重发握手 CRYPTO/HANDSHAKE_DONE/PING。确定性丢包测试覆盖六种握手包/ACK 丢失，详见 [loss-recovery.md](loss-recovery.md)。相关旧文中的恢复缺失描述由本段更新；任务 6 仍因应用流恢复及完整 RFC 边界尚缺而未完成，任务 7 拥塞控制也未完成。
+每空间活动记录、近期历史和待重发逻辑帧各有 4096 项上限；这些计数不是拥塞窗口。连续三份关键包丢失也有确定性测试，共十种场景。退役幂等、提前计时器回调和服务端恢复地址验证条件的回归详见 [loss-recovery.md](loss-recovery.md)。

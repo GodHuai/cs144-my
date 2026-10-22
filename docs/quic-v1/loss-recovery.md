@@ -4,7 +4,7 @@
 
 ## 事件循环接口
 
-`ConnectionConfig::clock_us` 可注入单调微秒时钟，默认 steady_clock；旧构造与收发调用保持兼容。`next_timeout_us()` 返回同一时钟的绝对期限，事件循环在到期时调用 `on_timeout()`，再排空 `poll_transmit()`。每次接收、发送或计时器回调之后重新读取期限，不能沿用旧期限。没有内部线程或 sleep。示意：
+`ConnectionConfig::clock_us` 可注入单调微秒时钟，默认 steady_clock。`next_timeout_us()` 返回同一时钟的绝对期限，事件循环在到期时调用 `on_timeout()`，再排空 `poll_transmit()`。每次接收、发送或计时器回调之后重新读取期限，不能沿用旧期限。没有内部线程或 sleep。示意：
 
 ```cpp
 while (auto output = connection.poll_transmit()) {
@@ -42,4 +42,4 @@ PTO 基于已有估计器，初始为 999ms，Initial/Handshake 不加 max_ack_d
 
 计时器回调会先核对当前选定期限，过期登记或提前到达的回调不会越过尚未到期的丢失计时器触发 PTO。Initial/Handshake 退役幂等，重复收发握手包不会重复重置全连接退避。恢复中“对端已完成地址验证”在服务端角色恒成立；它与服务端是否验证了客户端地址的反放大状态分开，故服务端 Initial ACK 会重置退避，客户端 Initial ACK 仍不会。
 
-验证结果：QUIC CTest **21/21**（21.00 秒）；全量 **52/59**（107.85 秒）。既有超时：wrapping_integers_roundtrip、wrapping_integers_extra、recv_transmit、recv_reorder_more、send_transmit；net_interface、router 缺少可执行文件。独立审查的三项计时器问题均通过失败复现与修复后验证，未留下 Minor。当前只保留隔离分支的本地提交。
+代码基准 `7abc5c7` 的验证记录（本次文档整理未重跑）：QUIC CTest **21/21**（21.00 秒）；全量 **52/59**（107.85 秒）。既有超时：wrapping_integers_roundtrip、wrapping_integers_extra、recv_transmit、recv_reorder_more、send_transmit；net_interface、router 缺少可执行文件。独立审查的三项计时器问题均通过失败复现与修复后验证，未留下 Minor。当前只保留隔离分支的本地提交。
