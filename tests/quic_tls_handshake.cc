@@ -94,6 +94,39 @@ void success()
   require( client.advance() == TlsProgress::Complete, "completion not stable" );
 }
 
+void connection_context()
+{
+  auto cc = config( false );
+  cc.defer_peer_initial_source_connection_id = true;
+  cc.peer_initial_source_connection_id.clear();
+  TlsHandshake client { cc }, server { config( true ) };
+  require( !client.bind_peer_initial_source_connection_id( std::string( 21, 'x' ) ), "oversize CID bound" );
+  client.advance();
+  require( client.bind_peer_initial_source_connection_id( "server" ), "actual Initial CID not bound" );
+  require( !client.bind_peer_initial_source_connection_id( "other" ), "peer CID rebound" );
+  require( !server.bind_peer_initial_source_connection_id( "client" ), "nondeferred CID rebound" );
+  run( client, server );
+  require( client.complete() && server.complete(), "deferred CID handshake failed" );
+  client.discard_keys( PacketKind::Initial );
+  require( !client.outgoing( PacketKind::Initial, 0, 100 ), "retired CRYPTO still exposed" );
+  client.discard_keys( PacketKind::Handshake );
+  require( !client.secret( PacketKind::Handshake, true ) && !client.secret( PacketKind::Handshake, false ),
+           "retired Handshake secrets still exposed" );
+  require( client.secret( PacketKind::OneRtt, true ).has_value() && client.complete(),
+           "retirement lost 1-RTT state" );
+  bool rejected = false;
+  try {
+    client.discard_keys( PacketKind::OneRtt );
+  } catch ( const std::invalid_argument& ) {
+    rejected = true;
+  }
+  require( rejected, "application keys retired through handshake API" );
+  TlsHandshake unbound { cc }, peer { config( true ) };
+  run( unbound, peer );
+  require( unbound.failed() && unbound.transport_error() == 0x08, "unbound peer parameters accepted" );
+  require( !unbound.bind_peer_initial_source_connection_id( "server" ), "failed context allowed binding" );
+}
+
 void terminal( TlsHandshake& failed )
 {
   require( failed.failed() && !failed.complete(), "failure reported as completion" );
@@ -251,6 +284,7 @@ int main()
 {
   try {
     success();
+    connection_context();
     failures();
     configuration();
     level_boundaries();

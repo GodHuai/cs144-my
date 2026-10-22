@@ -23,6 +23,8 @@ struct TlsConfig
   std::string peer_initial_source_connection_id {};
   std::optional<std::string> original_destination_connection_id {};
   std::optional<std::string> retry_source_connection_id {};
+  // Connection layer binds the actual authenticated Initial SCID before peer parameters arrive.
+  bool defer_peer_initial_source_connection_id { false };
 };
 
 enum class TlsProgress
@@ -45,6 +47,10 @@ public:
   TlsHandshake& operator=( const TlsHandshake& ) = delete;
 
   TlsProgress advance();
+  bool bind_peer_initial_source_connection_id( std::string cid );
+  // Connection calls only after the level's TLS input is released and the
+  // corresponding QUIC discard milestone is reached. Application level is invalid.
+  void discard_keys( PacketKind kind );
   bool receive( PacketKind kind, const CryptoFrame& frame );
   std::optional<CryptoFrame> outgoing( PacketKind kind, uint64_t offset, size_t max_data ) const;
 

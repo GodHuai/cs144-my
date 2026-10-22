@@ -42,3 +42,5 @@ ctest --test-dir build --output-on-failure --timeout 30 -j2
 2026-10-21 虚拟机实测：QUIC 专项 18/18 通过（含编译 fixture，11.01 秒）；全量 49/56 通过（101.68 秒）。失败项与前一轮一致：`wrapping_integers_roundtrip`、`wrapping_integers_extra`、`recv_transmit`、`recv_reorder_more`、`send_transmit` 达到 30 秒超时；`net_interface`、`router` 缺少可执行文件而未运行。全部 QUIC 检查通过不代表全量套件通过。完整日志保存在忽略的 `build/quic-udp-full-ctest.log`。
 
 独立审查未发现严重或重要问题。保留一项轻微测试改进：为 IPv4 单独增加 65508 字节拒绝断言；当前实现的 65507 上限正确，现有超限断言使用 65528 字节。
+
+后续里程碑已新增独立的 [HandshakeConnection](handshake-connection.md) 库类；本页所述原始 UDP 驱动仍保留为底层组合测试。

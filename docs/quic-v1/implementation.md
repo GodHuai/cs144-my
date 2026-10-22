@@ -387,3 +387,7 @@ ctest --test-dir build --output-on-failure -j2
 ## UDP 收发的新进展
 
 `quic/udp_socket.*` 已提供 Linux IPv4/IPv6 非阻塞收发和逐包 ECN；`tests/quic_udp_handshake.cc` 通过真实回环 UDP 贯通 TLS/包保护与 1-RTT 控制帧。详细接口、错误处置、反放大和测试驱动边界见 [udp.md](udp.md)。该驱动没有成为生产连接状态机；前文完整连接的待办仍然适用。
+
+## 可复用握手连接
+
+`HandshakeConnection` 已将握手编排移入库：真实 Initial CID 绑定 TLS 参数、认证后完整帧预检、三空间去重、乱序密文缓冲、反放大暂停恢复、双方确认和握手密钥丢弃。接口和仍缺少的可靠传输/流/关闭语义见 [handshake-connection.md](handshake-connection.md)。它尚不是完整 QUIC 连接。

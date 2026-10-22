@@ -166,7 +166,8 @@ struct TlsHandshake::Impl
                                                 self.config.peer_initial_source_connection_id,
                                                 view( self.config.original_destination_connection_id ),
                                                 view( self.config.retry_source_connection_id ) };
-      if ( self.peer || !decoded || !validate_transport_parameters( *decoded, context ) ) {
+      if ( self.config.defer_peer_initial_source_connection_id || self.peer || !decoded
+           || !validate_transport_parameters( *decoded, context ) ) {
         self.fail( 0x08 );
         return 0;
       }
@@ -303,6 +304,30 @@ TlsHandshake::TlsHandshake( TlsConfig config, size_t receive_capacity, size_t se
   : impl_( std::make_unique<Impl>( std::move( config ), receive_capacity, send_capacity ) )
 {}
 TlsHandshake::~TlsHandshake() = default;
+
+bool TlsHandshake::bind_peer_initial_source_connection_id( std::string cid )
+{
+  if ( !impl_->config.defer_peer_initial_source_connection_id || impl_->peer || impl_->error || cid.size() > 20 )
+    return false;
+  impl_->config.peer_initial_source_connection_id = std::move( cid );
+  impl_->config.defer_peer_initial_source_connection_id = false;
+  return true;
+}
+
+void TlsHandshake::discard_keys( PacketKind kind )
+{
+  if ( kind != PacketKind::Initial && kind != PacketKind::Handshake )
+    throw std::invalid_argument( "only handshake encryption levels can be retired" );
+  if ( kind == PacketKind::Handshake ) {
+    for ( size_t i = 0; i < 2; ++i ) {
+      if ( impl_->keys[i] ) {
+        OPENSSL_cleanse( impl_->keys[i]->data(), impl_->keys[i]->size() );
+        impl_->keys[i].reset();
+      }
+    }
+  }
+  impl_->streams.discard( kind );
+}
 
 TlsProgress TlsHandshake::advance()
 {
