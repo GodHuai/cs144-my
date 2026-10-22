@@ -14,9 +14,9 @@
 
 客户端创建 TLS 时显式延后绑定服务端 Initial SCID。收到认证的 Initial 后，调用新增的 `bind_peer_initial_source_connection_id()` 一次性绑定；TLS 参数回调必须检查实际 CID，未绑定或参数不一致均失败为 `0x08`。原有直接使用 `TlsHandshake` 的默认行为保持不变。
 
-只有通过 AEAD 的包才会记录包号和处理帧。新增 `open_initial_packet_detailed()` 区分认证失败的静默丢弃与认证后保留位错误（`0x0a`）；旧 optional 接口保留兼容。整个包先完成帧格式、包类型放置、HANDSHAKE_DONE 角色及 ACK 最大包号检查，再交付 CRYPTO，避免包后部的非法帧让前部 CRYPTO 提前改变握手。重复包只计入新收到的数据报字节，不重复交付。
+只有通过 AEAD 的包才会记录包号和处理帧。新增 `open_initial_packet_detailed()` 区分认证失败的静默丢弃与认证后保留位错误（`0x0a`）；旧 optional 接口保留兼容。整个包先完成帧格式、包类型放置、HANDSHAKE_DONE 角色及 ACK 对实际交付包号的检查，再交付 CRYPTO，避免包后部的非法帧让前部 CRYPTO 提前改变握手。重复包只计入新收到的数据报字节，不重复交付。
 
-缺少密钥或 TLS 尚未完成时，密文最多缓存 64 个包、合计 65536 字节；溢出丢弃新包，不根据未认证流量判定对端协议错误。新密钥可用时重试缓存，不重复增加反放大额度。每个包号空间仅保留最近 4096 个包号的去重范围；更旧包丢弃，这不是 ACK 历史或恢复策略。
+缺少密钥或 TLS 尚未完成时，密文最多缓存 64 个包、合计 65536 字节；溢出丢弃新包，不根据未认证流量判定对端协议错误。新密钥可用时重试缓存，不重复增加反放大额度。每个包号空间仅保留最近 4096 个包号的去重范围；更旧包丢弃，ACK 记录另有同样大小的窗口；这不是丢包恢复策略。
 
 ## 状态与密钥
 
@@ -28,7 +28,7 @@
 
 ## 当前支持范围
 
-支持握手 CRYPTO、PADDING、PING、HANDSHAKE_DONE 和对端关闭。ACK 仅作基本合法性检查，包括不能确认尚未交付发送的最大包号；没有 ACK 生成、ACK 状态更新、RTT 接线、重传、PTO、拥塞控制或 ECN 验证。`send_ping()` 最多保留一个待发 PING。
+支持握手 CRYPTO、PADDING、PING、HANDSHAKE_DONE 和对端关闭。ACK 已接入生成与发送记录更新，详见 [acknowledgments.md](acknowledgments.md)；尚无 RTT 接线、重传、PTO、拥塞控制或 ECN 验证。`send_ping()` 最多保留一个待发 PING。
 
 STREAM、流量控制、连接 ID 生命周期、路径控制及其它未实现语义不会被交给应用，认证后遇到它们以本地 INTERNAL_ERROR (`0x01`) 结束；这不表示它们本身都是对端协议违规。后握手 CRYPTO 和密钥更新也尚不支持。该类不接受 Retry、0-RTT、版本协商或恢复，不提供监听器、动态多连接分发、空闲超时及外部互通保证。
 

@@ -391,3 +391,6 @@ ctest --test-dir build --output-on-failure -j2
 ## 可复用握手连接
 
 `HandshakeConnection` 已将握手编排移入库：真实 Initial CID 绑定 TLS 参数、认证后完整帧预检、三空间去重、乱序密文缓冲、反放大暂停恢复、双方确认和握手密钥丢弃。接口和仍缺少的可靠传输/流/关闭语义见 [handshake-connection.md](handshake-connection.md)。它尚不是完整 QUIC 连接。
+
+
+ACK 里程碑：即时确认、分空间的有界发送记录与认证重复包重新确认已接入连接，见 [acknowledgments.md](acknowledgments.md)。前文关于 ACK 完全缺失的历史描述已由此替代；RTT 接线、丢包恢复、PTO 和拥塞控制仍待实现。

@@ -1,9 +1,11 @@
 #include "handshake_connection.hh"
 
+#include "acknowledgments.hh"
 #include "anti_amplification.hh"
 #include "initial_packet.hh"
 #include "packet_number_space.hh"
 #include "protected_packet.hh"
+#include <chrono>
 
 #include <array>
 #include <deque>
@@ -16,6 +18,17 @@ namespace {
 size_t index( PacketKind kind )
 {
   return static_cast<size_t>( packet_number_space( kind ) );
+}
+uint64_t now_us()
+{
+  return static_cast<uint64_t>(
+    std::chrono::duration_cast<std::chrono::microseconds>( std::chrono::steady_clock::now().time_since_epoch() )
+      .count() );
+}
+bool ack_eliciting( const Frame& frame )
+{
+  return !std::holds_alternative<PaddingFrame>( frame ) && !std::holds_alternative<AckFrame>( frame )
+         && !std::holds_alternative<ConnectionCloseFrame>( frame );
 }
 bool terminal( ConnectionState state )
 {
@@ -35,7 +48,7 @@ struct HandshakeConnection::Impl
   PacketNumberSpaces numbers {};
   AntiAmplificationBudget budget;
   std::array<uint64_t, 2> offsets {};
-  std::array<std::optional<uint64_t>, 3> sent_largest {};
+  PacketAcknowledgments acks {};
   bool initial_retired {}, handshake_retired {}, done_pending {}, ping_pending {};
   std::deque<std::string> pending {};
   size_t pending_bytes {};
@@ -46,6 +59,9 @@ struct HandshakeConnection::Impl
     std::string wire;
     size_t crypto_length;
     bool done;
+    bool ping;
+    bool eliciting;
+    std::optional<uint64_t> ack_generation;
   };
   std::optional<Prepared> prepared {};
 
@@ -56,9 +72,18 @@ struct HandshakeConnection::Impl
       initial.reset();
     }
     initial_retired = true;
+    acks.discard( PacketKind::Initial );
     if ( tls )
       tls->discard_keys( PacketKind::Initial );
     if ( prepared && prepared->kind == PacketKind::Initial )
+      prepared.reset();
+  }
+  void clear_handshake()
+  {
+    handshake_retired = true;
+    acks.discard( PacketKind::Handshake );
+    tls->discard_keys( PacketKind::Handshake );
+    if ( prepared && prepared->kind == PacketKind::Handshake )
       prepared.reset();
   }
   void stop( ConnectionState target, std::optional<uint64_t> code = std::nullopt )
@@ -73,6 +98,8 @@ struct HandshakeConnection::Impl
     pending_bytes = 0;
     prepared.reset();
     done_pending = ping_pending = false;
+    acks.discard( PacketKind::Handshake );
+    acks.discard( PacketKind::OneRtt );
   }
   void advance()
   {
@@ -82,8 +109,7 @@ struct HandshakeConnection::Impl
       state = config.tls.server ? ConnectionState::Confirmed : ConnectionState::Established;
       if ( config.tls.server ) {
         done_pending = true;
-        handshake_retired = true;
-        tls->discard_keys( PacketKind::Handshake );
+        clear_handshake();
       }
     }
   }
@@ -146,7 +172,7 @@ struct HandshakeConnection::Impl
         return false;
       }
       if ( const auto* ack = std::get_if<AckFrame>( &frame ) ) {
-        if ( !sent_largest[index( kind )] || ack->ranges.front().largest > *sent_largest[index( kind )] ) {
+        if ( !acks.valid_ack( kind, *ack ) ) {
           stop( ConnectionState::Failed, 0x0a );
           return false;
         }
@@ -216,12 +242,20 @@ struct HandshakeConnection::Impl
       plaintext = opened.packet->plaintext;
     }
     // Duplicate detection precedes semantic dispatch (including late TLS data).
-    if ( !numbers.record_authenticated( kind, number ) )
-      return ConnectionReceive::Discarded;
+    const bool fresh = numbers.record_authenticated( kind, number );
     const auto new_largest = *numbers.largest_received( kind );
     if ( new_largest >= 4096 )
       numbers.retire_received_below( kind, new_largest - 4095 );
     const auto frames = decode_frames( plaintext );
+    if ( !fresh ) {
+      if ( frames ) {
+        bool eliciting = false;
+        for ( const auto& frame : *frames )
+          eliciting = eliciting || ack_eliciting( frame );
+        acks.received( kind, number, eliciting, now_us() );
+      }
+      return ConnectionReceive::Discarded;
+    }
     if ( !frames ) {
       stop( ConnectionState::Failed, 0x07 );
       return ConnectionReceive::Failed;
@@ -234,6 +268,10 @@ struct HandshakeConnection::Impl
         return ConnectionReceive::Processed;
       }
     }
+    bool eliciting = false;
+    for ( const auto& frame : *frames )
+      eliciting = eliciting || ack_eliciting( frame );
+    acks.received( kind, number, eliciting, now_us() );
     if ( !peer_id && kind == PacketKind::Initial ) {
       peer_id = layout->scid;
       if ( config.tls.server ) {
@@ -254,15 +292,16 @@ struct HandshakeConnection::Impl
       clear_initial();
     }
     for ( const auto& frame : *frames ) {
-      if ( const auto* crypto = std::get_if<CryptoFrame>( &frame ) ) {
+      if ( const auto* ack = std::get_if<AckFrame>( &frame ) ) {
+        acks.apply_ack( kind, *ack );
+      } else if ( const auto* crypto = std::get_if<CryptoFrame>( &frame ) ) {
         if ( !tls->receive( kind, *crypto ) ) {
           stop( ConnectionState::Failed, tls->transport_error().value_or( 0x01 ) );
           return ConnectionReceive::Failed;
         }
       } else if ( std::holds_alternative<HandshakeDoneFrame>( frame ) ) {
         state = ConnectionState::Confirmed;
-        handshake_retired = true;
-        tls->discard_keys( PacketKind::Handshake );
+        clear_handshake();
       }
     }
     advance();
@@ -298,27 +337,48 @@ struct HandshakeConnection::Impl
       return std::nullopt;
     if ( !prepared ) {
       std::optional<CryptoFrame> crypto {};
+      std::optional<PacketAcknowledgments::PendingAck> ack {};
       PacketKind kind = PacketKind::OneRtt;
-      for ( const auto level : { PacketKind::Initial, PacketKind::Handshake } ) {
+      bool done = false, ping = false;
+      const auto exponent
+        = static_cast<uint8_t>( transport_parameter_integer( config.tls.local_parameters, 0x0a ).value_or( 3 ) );
+      bool selected = false;
+      for ( const auto level : { PacketKind::Initial, PacketKind::Handshake, PacketKind::OneRtt } ) {
         if ( ( level == PacketKind::Initial && initial_retired )
-             || ( level == PacketKind::Handshake && handshake_retired ) )
+             || ( level == PacketKind::Handshake && handshake_retired )
+             || ( level == PacketKind::OneRtt && !tls->complete() ) )
           continue;
-        crypto = tls->outgoing( level, offsets[index( level )], 600 );
-        if ( crypto ) {
+        ack = acks.pending_ack( level, now_us(), exponent );
+        if ( acks.can_send( level ) ) {
+          if ( level != PacketKind::OneRtt )
+            crypto = tls->outgoing( level, offsets[index( level )], ack ? 400 : 600 );
+          else {
+            done = done_pending;
+            ping = !done && ping_pending;
+          }
+        }
+        if ( crypto || ack || done || ping ) {
           kind = level;
+          selected = true;
           break;
         }
       }
-      if ( !crypto && !done_pending && !ping_pending )
+      if ( !selected )
         return std::nullopt;
       const auto number = numbers.allocate( kind );
       if ( !number ) {
         stop( ConnectionState::Failed, 0x01 );
         return std::nullopt;
       }
-      auto payload = crypto
-                       ? encode_frame( *crypto )
-                       : ( done_pending ? encode_frame( HandshakeDoneFrame {} ) : encode_frame( PingFrame {} ) );
+      std::string payload;
+      if ( ack )
+        payload += encode_frame( ack->frame );
+      if ( crypto )
+        payload += encode_frame( *crypto );
+      else if ( done )
+        payload += encode_frame( HandshakeDoneFrame {} );
+      else if ( ping )
+        payload += encode_frame( PingFrame {} );
       std::string wire;
       if ( kind == PacketKind::Initial ) {
         // Size the final protected UDP payload, including the two-byte Length,
@@ -346,19 +406,27 @@ struct HandshakeConnection::Impl
                  ? seal_handshake_packet( keys, *peer_id, config.local_cid, *number, 4, payload )
                  : seal_one_rtt_packet( keys, *peer_id, *number, 4, payload );
       }
-      prepared
-        = Prepared { kind, *number, std::move( wire ), crypto ? crypto->data.size() : 0, !crypto && done_pending };
+      prepared = Prepared { kind,
+                            *number,
+                            std::move( wire ),
+                            crypto ? crypto->data.size() : 0,
+                            done,
+                            ping,
+                            bool( crypto ) || done || ping,
+                            ack ? std::optional<uint64_t> { ack->generation } : std::nullopt };
     }
     if ( !budget.record_sent( prepared->wire.size() ) )
       return std::nullopt;
     auto output = std::move( *prepared );
     prepared.reset();
-    sent_largest[index( output.kind )] = output.number;
+    acks.sent( output.kind, output.number, output.eliciting );
+    if ( output.ack_generation )
+      acks.ack_sent( output.kind, *output.ack_generation );
     if ( output.crypto_length )
       offsets[index( output.kind )] += output.crypto_length;
     else if ( output.done )
       done_pending = false;
-    else
+    else if ( output.ping )
       ping_pending = false;
     if ( !config.tls.server && output.kind == PacketKind::Handshake )
       clear_initial();
@@ -415,6 +483,10 @@ std::optional<UdpDatagram> HandshakeConnection::poll_transmit()
     impl_->stop( ConnectionState::Failed, 0x01 );
     return std::nullopt;
   }
+}
+size_t HandshakeConnection::packets_awaiting_ack( PacketKind kind ) const
+{
+  return impl_->acks.outstanding( kind );
 }
 bool HandshakeConnection::send_ping()
 {

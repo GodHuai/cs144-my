@@ -31,7 +31,7 @@ enum class ConnectionReceive
 };
 
 // Single-threaded, single pinned UDP peer; reusable sans-I/O handshake engine.
-// No ACK generation/recovery, streams, congestion control, listener, migration or
+// No loss recovery, streams, congestion control, listener, migration or
 // close timers yet. It is not a complete QUIC transport. Caller provides random
 // 8..20-byte CIDs and dispatches datagrams to the appropriate connection.
 class HandshakeConnection
@@ -45,6 +45,7 @@ public:
   // Handoff reserves amplification bytes and advances send cursors. If UDP
   // would block, retain/retry THIS datagram, without polling for its replacement.
   std::optional<UdpDatagram> poll_transmit();
+  size_t packets_awaiting_ack( PacketKind kind ) const;
   bool send_ping(); // One bounded pending PING, only after TLS completion.
   ConnectionState state() const;
   std::optional<uint64_t> transport_error() const;

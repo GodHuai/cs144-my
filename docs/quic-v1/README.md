@@ -47,6 +47,6 @@
 
 ## 一句话检查当前边界
 
-已有 QUIC v1 基础编解码、Initial/Handshake/1-RTT 单包保护、分级别 CRYPTO 字节流和真实 TLS 1.3 双端握手；内存测试已贯通受保护握手和双向 1-RTT 数据；新增双栈 UDP/ECN 接口，真实回环测试已贯通加密握手和 1-RTT 控制帧；新增可复用握手连接引擎，管理实际 CID、包号、反放大、乱序密文、确认和握手密钥丢弃。**尚无具备 ACK/恢复和流量控制的完整 QUIC 连接**。缺失内容和逐项状态以 [coverage.md](coverage.md) 为准。
+已有 QUIC v1 基础编解码、Initial/Handshake/1-RTT 单包保护、分级别 CRYPTO 字节流和真实 TLS 1.3 双端握手；内存测试已贯通受保护握手和双向 1-RTT 数据；新增双栈 UDP/ECN 接口，真实回环测试已贯通加密握手和 1-RTT 控制帧；新增可复用握手连接引擎，管理实际 CID、包号、反放大、乱序密文、确认和握手密钥丢弃。新增即时 ACK 和有界发送记录，见 [acknowledgments.md](acknowledgments.md)。**尚无具备丢包恢复和流量控制的完整 QUIC 连接**。缺失内容和逐项状态以 [coverage.md](coverage.md) 为准。
 
 构建需要带 external QUIC TLS API 的 OpenSSL ≥3.5（SSL/Crypto）；固定版本和工作树内构建方法见 [tls-handshake.md](tls-handshake.md)。

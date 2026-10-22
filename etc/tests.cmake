@@ -110,3 +110,5 @@ ttest(quic_protected_packet)
 ttest(quic_udp_socket)
 ttest(quic_udp_handshake)
 ttest(quic_handshake_connection)
+
+ttest(quic_acknowledgments)

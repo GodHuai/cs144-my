@@ -106,6 +106,18 @@ void positive( bool reorder, bool coalesce )
   require( client.send_ping() && server.send_ping(), "established connection cannot queue PING" );
   transfer( client, server, client_address );
   transfer( server, client, server_address );
+  // Drain the immediate ACK exchange. ACK-only traffic must reach quiescence.
+  for ( size_t round = 0; round < 4; ++round ) {
+    transfer( client, server, client_address );
+    transfer( server, client, server_address );
+  }
+  require( client.packets_awaiting_ack( PacketKind::OneRtt ) == 0
+             && server.packets_awaiting_ack( PacketKind::OneRtt ) == 0,
+           "PING/HANDSHAKE_DONE not acknowledged" );
+  require( !client.poll_transmit() && !server.poll_transmit(), "ACK-only feedback loop" );
+  require( client.packets_awaiting_ack( PacketKind::Initial ) == 0
+             && client.packets_awaiting_ack( PacketKind::Handshake ) == 0,
+           "retired packet space retains history" );
   // Initial keys/processing are retired after Handshake milestones.
   require( deliver( server, first.front(), client_address ) == ConnectionReceive::Discarded,
            "retired Initial accepted" );
@@ -142,6 +154,38 @@ void discarded_inputs()
   for ( const auto& d : drain( server ) )
     deliver( client, d, server_address );
   require( client.state() == ConnectionState::Established, "queued invalid packets blocked real flight" );
+}
+void initial_ack_exchange()
+{
+  HandshakeConnection server { config( true ), client_address };
+  const auto ping = initial_packet( encode_frame( PingFrame {} ), 2 );
+  require( server.receive( { client_address, ping, 0 } ) == ConnectionReceive::Processed, "Initial PING rejected" );
+  const auto output = server.poll_transmit();
+  require( output && output->payload.size() == 1200, "Initial ACK size" );
+  const auto keys = derive_initial_keys( "original" );
+  const auto opened = open_initial_packet( keys->server, InitialSender::Server, output->payload, 0, std::nullopt );
+  require( opened.has_value(), "Initial ACK authentication" );
+  const auto frames = decode_frames( opened->plaintext );
+  require( frames && std::holds_alternative<AckFrame>( frames->front() ), "ACK frame missing" );
+  const auto& ack = std::get<AckFrame>( frames->front() );
+  require( ack.ranges.size() == 1 && ack.ranges.front().smallest == 2 && ack.ranges.front().largest == 2
+             && ack.ack_delay == 0,
+           "wrong ACK range" );
+  require( server.packets_awaiting_ack( PacketKind::Initial ) == 0 && !server.poll_transmit(), "ACK elicited ACK" );
+  require( server.receive( { client_address, ping, 0 } ) == ConnectionReceive::Discarded
+             && server.poll_transmit().has_value(),
+           "authenticated duplicate not re-ACKed" );
+  auto damaged = ping;
+  damaged.back() ^= 1;
+  server.receive( { client_address, damaged, 0 } );
+  require( !server.poll_transmit(), "unauthenticated packet scheduled ACK" );
+  // Initial protection continues to use the original DCID, not the routed CID.
+  std::string payload = encode_frame( AckFrame { 0, { { 0, 1 } }, std::nullopt } );
+  payload.resize( 1200, '\0' );
+  const auto wire
+    = seal_initial_packet( keys->client, InitialSender::Client, "serverid", "clientid", "", 3, 4, payload );
+  require( server.receive( { client_address, wire, 0 } ) == ConnectionReceive::Processed && !server.poll_transmit(),
+           "ACK-only input created feedback" );
 }
 void errors_and_close()
 {
@@ -201,6 +245,18 @@ void amplification_pause()
   require( !flight.empty(), "credited bytes did not resume prepared packet" );
   for ( const auto& d : flight )
     deliver( client, d, server_address );
+  // Re-ACKing the duplicate Initial also consumes 1200 amplification bytes.
+  // Keep crediting actual arrivals until the complete large TLS flight fits.
+  for ( size_t round = 0; round < 8 && client.state() == ConnectionState::Handshaking; ++round ) {
+    for ( const auto& d : first ) {
+      received_bytes += d.payload.size();
+      deliver( server, d, client_address );
+    }
+    for ( const auto& d : drain( server ) ) {
+      sent_bytes += d.payload.size();
+      require( deliver( client, d, server_address ) != ConnectionReceive::Failed, "resumed packet failed" );
+    }
+  }
   require( client.state() == ConnectionState::Established, "resumed flight lost TLS bytes or PN state" );
   transfer( client, server, client_address );
   transfer( server, client, server_address );
@@ -358,6 +414,7 @@ int main()
 {
   try {
     authenticated_initial_error();
+    initial_ack_exchange();
     minimum_receiver( 8 );
     minimum_receiver( 20 );
     positive( false, false );
