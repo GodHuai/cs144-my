@@ -105,3 +105,4 @@ stest(byte_stream_speed_test)
 stest(reassembler_speed_test)
 
 ttest(quic_tls_handshake)
+ttest(quic_protected_packet)

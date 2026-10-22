@@ -15,6 +15,7 @@
    [retry-integrity.md](retry-integrity.md) 解释 Retry 伪包和接收前的完整性验证。
    [initial-packet.md](initial-packet.md) 逐步拆解 Initial 整包封装、解封和认证顺序。
    [tls-handshake.md](tls-handshake.md) 解释真实 TLS 1.3 握手、证书/ALPN 和加密级别回调。
+   [protected-packets.md](protected-packets.md) 解释 TLS secret 怎样派生为 Handshake/1-RTT 包密钥并保护整包。
    [crypto-streams.md](crypto-streams.md) 解释 TLS 字节的分级别重组、缓冲上限和重传分片。
 3. [coverage.md](coverage.md)：查某条规范现在有代码、有测试，还是尚未开始。
 4. [design.md](design.md) 与 [tasks.md](tasks.md)：完整连接的目标架构和后续工作顺序；它们是计划，不是当前实现证据。
@@ -39,10 +40,11 @@
 | 怎样验证 Retry 确实对应最初的 Initial？ | RFC 9001 §5.8 | [retry_integrity.hh](../../quic/retry_integrity.hh)、[retry_integrity.cc](../../quic/retry_integrity.cc) | [quic_retry_integrity.cc](../../tests/quic_retry_integrity.cc) |
 | 怎样将乱序 CRYPTO 帧还原为 TLS 字节，并保留重传数据？ | RFC 9000 §7.5、§19.6，RFC 9001 §4.1.3 | [crypto_streams.hh](../../quic/crypto_streams.hh)、[crypto_streams.cc](../../quic/crypto_streams.cc) | [quic_crypto_streams.cc](../../tests/quic_crypto_streams.cc) |
 | TLS 怎样验证身份并交出 Handshake/1-RTT secret？ | RFC 9001 §4、§8 | [tls_handshake.hh](../../quic/tls_handshake.hh)、[tls_handshake.cc](../../quic/tls_handshake.cc) | [quic_tls_handshake.cc](../../tests/quic_tls_handshake.cc) |
+| TLS secret 如何保护 Handshake/1-RTT 整包？ | RFC 9001 §5.1、§5.3–5.5 | [packet_keys.hh](../../quic/packet_keys.hh)、[protected_packet.cc](../../quic/protected_packet.cc) | [quic_protected_packet.cc](../../tests/quic_protected_packet.cc) |
 | 收到 ACK 后如何更新 RTT 和 PTO？ | RFC 9002 §5–6 | [rtt_estimator.hh](../../quic/rtt_estimator.hh)、[rtt_estimator.cc](../../quic/rtt_estimator.cc) | [quic_packet_primitives.cc](../../tests/quic_packet_primitives.cc) |
 
 ## 一句话检查当前边界
 
-已有 QUIC v1 基础编解码、Initial 单包保护、分级别 CRYPTO 字节流和真实 TLS 1.3 双端握手；**还不能发送或接收一个经过 TLS 与 AEAD 认证的完整 QUIC 连接**。缺失内容和逐项状态以 [coverage.md](coverage.md) 为准。
+已有 QUIC v1 基础编解码、Initial/Handshake/1-RTT 单包保护、分级别 CRYPTO 字节流和真实 TLS 1.3 双端握手；内存测试已贯通受保护握手和双向 1-RTT 数据。**尚无带 UDP、ACK/恢复和流量控制的完整 QUIC 连接**。缺失内容和逐项状态以 [coverage.md](coverage.md) 为准。
 
 构建需要带 external QUIC TLS API 的 OpenSSL ≥3.5（SSL/Crypto）；固定版本和工作树内构建方法见 [tls-handshake.md](tls-handshake.md)。

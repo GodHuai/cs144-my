@@ -1,5 +1,7 @@
 #pragma once
 
+#include "packet_keys.hh"
+
 #include <array>
 #include <cstdint>
 #include <optional>
@@ -8,13 +10,8 @@
 
 namespace quic {
 
-struct InitialPacketKeys
-{
-  std::array<uint8_t, 32> secret;
-  std::array<uint8_t, 16> key;
-  std::array<uint8_t, 12> iv;
-  std::array<uint8_t, 16> hp;
-};
+// Backward-compatible name for the shared AES-128 packet key material.
+using InitialPacketKeys = PacketProtectionKeys;
 
 struct InitialKeys
 {

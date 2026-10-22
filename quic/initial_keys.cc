@@ -72,13 +72,18 @@ array<uint8_t, N> expand_label( const array<uint8_t, 32>& secret, const string_v
 InitialPacketKeys derive_direction( const array<uint8_t, 32>& initial_secret, const string_view label )
 {
   const auto traffic_secret = expand_label<32>( initial_secret, label );
+  return derive_packet_keys( traffic_secret );
+}
+
+} // namespace
+
+PacketProtectionKeys derive_packet_keys( const array<uint8_t, 32>& traffic_secret )
+{
   return { traffic_secret,
            expand_label<16>( traffic_secret, "quic key" ),
            expand_label<12>( traffic_secret, "quic iv" ),
            expand_label<16>( traffic_secret, "quic hp" ) };
 }
-
-} // namespace
 
 optional<InitialKeys> derive_initial_keys( const string_view dcid )
 {
@@ -125,10 +130,10 @@ void check_input_size( const string_view header, const string_view payload )
 
 } // namespace
 
-string encrypt_initial_payload( const InitialPacketKeys& keys,
-                                const string_view unprotected_header,
-                                const uint64_t packet_number,
-                                const string_view plaintext )
+string encrypt_packet_payload( const InitialPacketKeys& keys,
+                               const string_view unprotected_header,
+                               const uint64_t packet_number,
+                               const string_view plaintext )
 {
   check_input_size( unprotected_header, plaintext );
   const auto nonce = packet_nonce( keys, packet_number );
@@ -165,10 +170,10 @@ string encrypt_initial_payload( const InitialPacketKeys& keys,
   return result;
 }
 
-optional<string> decrypt_initial_payload( const InitialPacketKeys& keys,
-                                          const string_view unprotected_header,
-                                          const uint64_t packet_number,
-                                          const string_view ciphertext_and_tag )
+optional<string> decrypt_packet_payload( const InitialPacketKeys& keys,
+                                         const string_view unprotected_header,
+                                         const uint64_t packet_number,
+                                         const string_view ciphertext_and_tag )
 {
   if ( ciphertext_and_tag.size() < 16 ) {
     return nullopt;
@@ -213,7 +218,7 @@ optional<string> decrypt_initial_payload( const InitialPacketKeys& keys,
   return plaintext;
 }
 
-optional<array<uint8_t, 5>> initial_header_mask( const array<uint8_t, 16>& hp_key, const string_view sample )
+optional<array<uint8_t, 5>> packet_header_mask( const array<uint8_t, 16>& hp_key, const string_view sample )
 {
   if ( sample.size() != 16 ) {
     return nullopt;
@@ -236,6 +241,28 @@ optional<array<uint8_t, 5>> initial_header_mask( const array<uint8_t, 16>& hp_ke
   array<uint8_t, 5> mask {};
   copy_n( block.begin(), mask.size(), mask.begin() );
   return mask;
+}
+
+// Preserve the original Initial API while sharing one crypto implementation.
+string encrypt_initial_payload( const InitialPacketKeys& keys,
+                                const string_view header,
+                                const uint64_t packet_number,
+                                const string_view plaintext )
+{
+  return encrypt_packet_payload( keys, header, packet_number, plaintext );
+}
+
+optional<string> decrypt_initial_payload( const InitialPacketKeys& keys,
+                                          const string_view header,
+                                          const uint64_t packet_number,
+                                          const string_view ciphertext )
+{
+  return decrypt_packet_payload( keys, header, packet_number, ciphertext );
+}
+
+optional<array<uint8_t, 5>> initial_header_mask( const array<uint8_t, 16>& hp_key, const string_view sample )
+{
+  return packet_header_mask( hp_key, sample );
 }
 
 } // namespace quic

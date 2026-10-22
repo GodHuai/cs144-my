@@ -6,7 +6,7 @@
 
 ## 为什么 TLS 不直接读写 socket
 
-QUIC 把 TLS 握手消息装入 CRYPTO 帧，使用自己的包保护替代 TLS record layer。TLS 交出的 `traffic secret` 是后续派生 QUIC key、iv、hp 的输入，不是直接可用的包密钥。当前已能拿到 Handshake 和 1-RTT 的双向 secret，但还没有用它们保护这些级别的整包。
+QUIC 把 TLS 握手消息装入 CRYPTO 帧，使用自己的包保护替代 TLS record layer。TLS 交出的 `traffic secret` 是后续派生 QUIC key、iv、hp 的输入，不是直接可用的包密钥。现在已由 `protected_packet.*` 将这些 secret 展开为包密钥并保护 Handshake/1-RTT 整包，见 [protected-packets.md](protected-packets.md)。
 
 ```mermaid
 flowchart LR
@@ -81,7 +81,7 @@ TLS 边界错误映射仅识别 OpenSSL 的 `SSL_R_NOT_ON_RECORD_BOUNDARY`，不
 
 `tests/quic_tls_handshake.cc` 使用构建时生成的 localhost 证书，测试真实双端握手、分级别乱序与重复、两个方向的 Handshake/1-RTT secret 相等关系，以及错误 CA、主机名、ALPN、CID、CRYPTO 重叠、接收/发送上限、0-RTT 和非法配置；另覆盖每输入 13 字节就推进一次 TLS、旧级别有缺口/连续残留、迟到扩展与合法重传，以及部分 TLS 消息后的销毁。
 
-本阶段仅启用 `TLS_AES_128_GCM_SHA256`，关闭票据和 session cache，没有恢复、0-RTT、客户端证书认证或握手后的消息处理。`advance()` 完成后稳定返回 Complete；它不会驱动 NewSessionTicket/KeyUpdate 等后握手消息。**TLS Complete 不等于 QUIC handshake confirmed**，也不单独授权应用 STREAM 投递。UDP、握手包/1-RTT 包保护、密钥丢弃、ACK/丢包和完整互通仍待连接层接线。
+本阶段仅启用 `TLS_AES_128_GCM_SHA256`，关闭票据和 session cache，没有恢复、0-RTT、客户端证书认证或握手后的消息处理。`advance()` 完成后稳定返回 Complete；它不会驱动 NewSessionTicket/KeyUpdate 等后握手消息。**TLS Complete 不等于 QUIC handshake confirmed**，也不单独授权应用 STREAM 投递。Handshake/1-RTT 的 AES 整包保护已有独立模块和内存集成测试；UDP、生产连接状态、密钥丢弃、ACK/丢包和完整互通仍待接线。
 
 2026-10-21 最终验证记录：QUIC 专项 **15/15** 通过（含编译夹具），新增测试使用 ASan/UBSan，Debug 静态库也构建成功；格式、shell 语法与 diff 空白检查通过。过期证书替换后重新运行夹具，验证其能生成有效新证书。独立审查的重要边界问题均已修正并通过回归。
 
