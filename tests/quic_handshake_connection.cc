@@ -252,6 +252,59 @@ void initial_ack_exchange()
   require( server.receive( { client_address, wire, 0 } ) == ConnectionReceive::Processed && !server.poll_transmit(),
            "ACK-only input created feedback" );
 }
+void congestion_scheduling()
+{
+  uint64_t now = 1000;
+  auto cc = config( false ), sc = config( true );
+  cc.clock_us = sc.clock_us = [&now] { return now; };
+  HandshakeConnection client { cc, server_address }, server { sc, client_address };
+  for ( unsigned round = 0; round < 8; ++round ) {
+    now += 1000;
+    transfer( client, server, client_address );
+    now += 1000;
+    transfer( server, client, server_address );
+  }
+  require( client.state() == ConnectionState::Confirmed, "congestion handshake" );
+  require( client.congestion_stats().bytes_in_flight == 0, "key retirement leaked flight" );
+  std::vector<UdpDatagram> held;
+  for ( unsigned i = 0; i < 1000; ++i ) {
+    require( client.send_ping(), "window PING queue" );
+    const auto output = client.poll_transmit();
+    if ( !output )
+      break;
+    held.push_back( *output );
+  }
+  require( !held.empty() && held.size() < 1000, "congestion window did not stop sending" );
+  const auto full = client.congestion_stats();
+  require( full.bytes_in_flight <= full.window && full.window - full.bytes_in_flight < 1200,
+           "window accounting mismatch" );
+  require( !client.poll_transmit(), "fresh PING escaped full window" );
+  require( server.send_ping(), "peer PING queue" );
+  auto peer_ping = server.poll_transmit();
+  require( peer_ping.has_value(), "peer PING missing" );
+  deliver( client, *peer_ping, server_address );
+  const auto ack_only = client.poll_transmit();
+  require( ack_only && client.congestion_stats().bytes_in_flight == full.bytes_in_flight,
+           "full window blocked ACK or ACK counted as flight" );
+  const auto deadline = client.next_timeout_us();
+  require( deadline.has_value(), "congestion blocking suppressed PTO" );
+  now = *deadline;
+  client.on_timeout();
+  const auto probe = client.poll_transmit();
+  require( probe && client.congestion_stats().bytes_in_flight > full.bytes_in_flight,
+           "PTO probe blocked by window/fresh work" );
+  require( !client.poll_transmit(), "probe bypass leaked into fresh sending" );
+  // Deliver every packet, including the pure ACK: packet numbers must not have
+  // been consumed by unsuccessful polls, or the peer's ACK would fail preflight.
+  for ( const auto& d : held )
+    require( deliver( server, d, client_address ) != ConnectionReceive::Failed, "window packet rejected" );
+  require( deliver( server, *ack_only, client_address ) != ConnectionReceive::Failed, "ACK-only rejected" );
+  require( deliver( server, *probe, client_address ) != ConnectionReceive::Failed, "probe rejected" );
+  transfer( server, client, server_address );
+  require( client.state() == ConnectionState::Confirmed && client.congestion_stats().bytes_in_flight == 0,
+           "ACK did not release physical flight" );
+  require( client.poll_transmit().has_value(), "ACK did not reopen fresh sending" );
+}
 void probe_handoff_and_clock()
 {
   uint64_t now = 1000;
@@ -402,6 +455,9 @@ void amplification_pause()
   // Re-ACKing the duplicate Initial also consumes 1200 amplification bytes.
   // Keep crediting actual arrivals until the complete large TLS flight fits.
   for ( size_t round = 0; round < 8 && client.state() == ConnectionState::Handshaking; ++round ) {
+    // Congestion credit is independent of amplification credit. Let real ACKs
+    // release the previous server flight before sending the remaining TLS data.
+    transfer( client, server, client_address );
     for ( const auto& d : first ) {
       received_bytes += d.payload.size();
       deliver( server, d, client_address );
@@ -574,6 +630,7 @@ int main()
     for ( size_t mode = 0; mode < 10; ++mode )
       recover_dropped_flight( mode );
     initial_ack_exchange();
+    congestion_scheduling();
     minimum_receiver( 8 );
     minimum_receiver( 20 );
     positive( false, false );

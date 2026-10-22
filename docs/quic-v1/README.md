@@ -21,6 +21,7 @@
    [crypto-streams.md](crypto-streams.md) 解释 TLS 字节的分级别重组、缓冲上限和重传分片。
    [acknowledgments.md](acknowledgments.md) 手算 ACK 范围、区分已发送上界和活动包记录。
    [loss-recovery.md](loss-recovery.md) 讲解 ACK 取样、阈值丢包、迟到确认和 PTO 事件循环。
+   [congestion-control.md](congestion-control.md) 区分逻辑交付和物理在途，讲解 NewReno 窗口及 ACK/PTO 例外。
 3. [coverage.md](coverage.md)：查某条规范现在有代码、有测试，还是尚未开始。
 4. [design.md](design.md) 与 [tasks.md](tasks.md)：完整连接的目标架构和后续工作顺序；它们是计划，不是当前实现证据。
 5. `docs/superpowers/specs/`、`docs/superpowers/plans/`：每一轮小功能的设计与测试记录。
@@ -48,9 +49,10 @@
 | 收到 ACK 后如何更新 RTT 和 PTO？ | RFC 9002 §5–6 | [rtt_estimator.hh](../../quic/rtt_estimator.hh)、[rtt_estimator.cc](../../quic/rtt_estimator.cc)、[packet_recovery.cc](../../quic/packet_recovery.cc) | [quic_packet_primitives.cc](../../tests/quic_packet_primitives.cc)、[quic_packet_recovery.cc](../../tests/quic_packet_recovery.cc) |
 | 如何生成即时 ACK 并拒绝对未发送包的确认？ | RFC 9000 §13、§19.3 | [acknowledgments.cc](../../quic/acknowledgments.cc) | [quic_acknowledgments.cc](../../tests/quic_acknowledgments.cc) |
 | 如何将握手、ACK、恢复与 UDP 接在一起？ | RFC 9000 §5–8、RFC 9002 §5–6 | [handshake_connection.cc](../../quic/handshake_connection.cc)、[udp_socket.cc](../../quic/udp_socket.cc) | [quic_handshake_connection.cc](../../tests/quic_handshake_connection.cc)、[quic_udp_handshake.cc](../../tests/quic_udp_handshake.cc) |
+| 如何用线上字节约束发送并响应拥塞？ | RFC 9002 §7.2–7.5、§7.8 | [congestion_control.cc](../../quic/congestion_control.cc)、[packet_recovery.cc](../../quic/packet_recovery.cc) | [quic_congestion_control.cc](../../tests/quic_congestion_control.cc)、[quic_handshake_connection.cc](../../tests/quic_handshake_connection.cc) |
 
 ## 一句话检查当前边界
 
-代码基准 `7abc5c7`（2026-10-22）：基础编解码、AES 包保护、真实 TLS 1.3、单路径握手连接、双栈 UDP、即时 ACK、有界握手恢复、RTT 与 PTO 已贯通。**可靠应用流、流量控制、拥塞控制和第三方互通仍未完成。** 当前缺口见 [coverage.md](coverage.md)，最近测试记录为 QUIC 21/21、全量 52/59，详见 [loss-recovery.md](loss-recovery.md)。文档中的较早测试数字只代表相应历史里程碑。
+握手恢复基准为 `7abc5c7`（2026-10-22），后续已接入单路径 NewReno 基础控制；详见 [congestion-control.md](congestion-control.md)。基础编解码、AES 包保护、真实 TLS 1.3、单路径握手连接、双栈 UDP、即时 ACK、有界握手恢复、RTT 与 PTO 已贯通。**可靠应用流、流量控制、持续拥塞/pacing/ECN 及第三方互通仍未完成。** 当前缺口见 [coverage.md](coverage.md)，本阶段测试记录为 QUIC 22/22、全量 53/60，详见 [congestion-control.md](congestion-control.md)。文档中的较早测试数字只代表相应历史里程碑。
 
 构建需要带 external QUIC TLS API 的 OpenSSL ≥3.5（SSL/Crypto）；固定版本和工作树内构建方法见 [tls-handshake.md](tls-handshake.md)。

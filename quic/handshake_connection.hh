@@ -1,5 +1,6 @@
 #pragma once
 
+#include "congestion_control.hh"
 #include "rtt_estimator.hh"
 #include "tls_handshake.hh"
 #include "udp_socket.hh"
@@ -34,7 +35,7 @@ enum class ConnectionReceive
 };
 
 // Single-threaded, single pinned UDP peer; reusable sans-I/O handshake engine.
-// Bounded handshake loss recovery; no streams, congestion control, listener, migration or
+// Bounded handshake loss recovery and basic NewReno; no streams, listener, migration or
 // close timers yet. It is not a complete QUIC transport. Caller provides random
 // 8..20-byte CIDs and dispatches datagrams to the appropriate connection.
 class HandshakeConnection
@@ -51,6 +52,7 @@ public:
   std::optional<uint64_t> next_timeout_us() const;
   void on_timeout();
   RttEstimator rtt_estimate() const;
+  CongestionStats congestion_stats() const;
   size_t packets_awaiting_ack( PacketKind kind ) const;
   bool send_ping(); // One bounded pending PING, only after TLS completion.
   ConnectionState state() const;

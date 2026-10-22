@@ -56,19 +56,6 @@ struct HandshakeConnection::Impl
   bool initial_retired {}, handshake_retired {}, done_pending {}, ping_pending {};
   std::deque<std::string> pending {};
   size_t pending_bytes {};
-  struct Prepared
-  {
-    PacketKind kind;
-    uint64_t number;
-    std::string wire;
-    size_t crypto_length;
-    bool done;
-    bool ping;
-    bool eliciting;
-    std::optional<uint64_t> ack_generation;
-    std::shared_ptr<RecoveryData> data;
-  };
-  std::optional<Prepared> prepared {};
 
   uint64_t now_us()
   {
@@ -117,8 +104,6 @@ struct HandshakeConnection::Impl
     recovery.discard( PacketKind::Initial );
     if ( tls )
       tls->discard_keys( PacketKind::Initial );
-    if ( prepared && prepared->kind == PacketKind::Initial )
-      prepared.reset();
   }
   void clear_handshake()
   {
@@ -128,8 +113,6 @@ struct HandshakeConnection::Impl
     acks.discard( PacketKind::Handshake );
     recovery.discard( PacketKind::Handshake );
     tls->discard_keys( PacketKind::Handshake );
-    if ( prepared && prepared->kind == PacketKind::Handshake )
-      prepared.reset();
   }
   void stop( ConnectionState target, std::optional<uint64_t> code = std::nullopt )
   {
@@ -141,7 +124,6 @@ struct HandshakeConnection::Impl
     tls.reset();
     pending.clear();
     pending_bytes = 0;
-    prepared.reset();
     done_pending = ping_pending = false;
     acks.discard( PacketKind::Handshake );
     recovery.discard( PacketKind::Handshake );
@@ -385,61 +367,78 @@ struct HandshakeConnection::Impl
   {
     if ( terminal( state ) || !tls )
       return std::nullopt;
-    if ( !prepared ) {
-      std::optional<CryptoFrame> crypto {};
-      std::optional<RecoverySend> retry {};
-      std::optional<PacketAcknowledgments::PendingAck> ack {};
-      PacketKind kind = PacketKind::OneRtt;
+    const auto exponent
+      = static_cast<uint8_t>( transport_parameter_integer( config.tls.local_parameters, 0x0a ).value_or( 3 ) );
+    for ( const auto kind : { PacketKind::Initial, PacketKind::Handshake, PacketKind::OneRtt } ) {
+      if ( ( kind == PacketKind::Initial && initial_retired )
+           || ( kind == PacketKind::Handshake && handshake_retired )
+           || ( kind == PacketKind::OneRtt && !tls->complete() ) )
+        continue;
+      auto ack = acks.pending_ack( kind, now_us(), exponent );
+      std::optional<RecoverySend> retry;
+      std::optional<CryptoFrame> crypto;
       bool done = false, ping = false;
-      const auto exponent
-        = static_cast<uint8_t>( transport_parameter_integer( config.tls.local_parameters, 0x0a ).value_or( 3 ) );
-      bool selected = false;
-      for ( const auto level : { PacketKind::Initial, PacketKind::Handshake, PacketKind::OneRtt } ) {
-        if ( ( level == PacketKind::Initial && initial_retired )
-             || ( level == PacketKind::Handshake && handshake_retired )
-             || ( level == PacketKind::OneRtt && !tls->complete() ) )
-          continue;
-        ack = acks.pending_ack( level, now_us(), exponent );
-        if ( acks.can_send( level ) ) {
-          retry = recovery.take_pending( level );
-          if ( retry ) {
-            // Replayed CRYPTO is already counted in the fresh TLS send cursor.
-          } else if ( level != PacketKind::OneRtt )
-            crypto = tls->outgoing( level, offsets[index( level )], ack ? 400 : 600 );
-          else {
-            done = done_pending;
-            ping = !done && ping_pending;
-          }
-        }
-        if ( retry || crypto || ack || done || ping ) {
-          kind = level;
-          selected = true;
-          break;
+      if ( acks.can_send( kind ) ) {
+        retry = recovery.pending( kind ); // Peek; a blocked poll must not consume work.
+        if ( !retry && kind != PacketKind::OneRtt )
+          crypto = tls->outgoing( kind, offsets[index( kind )], ack ? 400 : 600 );
+        else if ( !retry && kind == PacketKind::OneRtt ) {
+          done = done_pending;
+          ping = !done && ping_pending;
         }
       }
-      if ( !selected )
+      if ( !retry && !crypto && !ack && !done && !ping )
+        continue;
+      const auto make_payload = [&] {
+        std::string payload;
+        if ( ack )
+          payload += encode_frame( ack->frame );
+        if ( retry )
+          payload += encode_frame( retry->data->frame );
+        else if ( crypto )
+          payload += encode_frame( *crypto );
+        else if ( done )
+          payload += encode_frame( HandshakeDoneFrame {} );
+        else if ( ping )
+          payload += encode_frame( PingFrame {} );
+        return payload;
+      };
+      auto payload = make_payload();
+      const auto wire_size = [&] {
+        if ( kind == PacketKind::Initial )
+          return size_t { 1200 };
+        const auto header
+          = kind == PacketKind::Handshake
+              ? build_long_header(
+                  LongPacketType::Handshake, *peer_id, config.local_cid, "", 0, 4, payload.size() + 16 )
+              : build_short_header( *peer_id, 0, 4, false, false, payload.size() + 16 );
+        return header.size() + payload.size() + 16;
+      };
+      bool eliciting = retry || crypto || done || ping;
+      if ( !recovery.can_send(
+             kind, wire_size(), eliciting, kind == PacketKind::Initial, retry && retry->probe ) ) {
+        // ACKs must still flow while fresh data or a normal retransmit is blocked.
+        if ( !ack )
+          continue;
+        retry.reset();
+        crypto.reset();
+        done = ping = eliciting = false;
+        payload = make_payload();
+        if ( !recovery.can_send( kind, wire_size(), false, kind == PacketKind::Initial ) )
+          continue;
+      }
+      const auto bytes = wire_size();
+      if ( const auto remaining = budget.remaining_bytes(); remaining && bytes > *remaining ) {
+        amplification_blocked = true;
         return std::nullopt;
+      }
       const auto number = numbers.allocate( kind );
       if ( !number ) {
         stop( ConnectionState::Failed, 0x01 );
         return std::nullopt;
       }
-      std::string payload;
-      if ( ack )
-        payload += encode_frame( ack->frame );
-      if ( retry )
-        payload += encode_frame( retry->data->frame );
-      else if ( crypto )
-        payload += encode_frame( *crypto );
-      else if ( done )
-        payload += encode_frame( HandshakeDoneFrame {} );
-      else if ( ping )
-        payload += encode_frame( PingFrame {} );
       std::string wire;
       if ( kind == PacketKind::Initial ) {
-        // Size the final protected UDP payload, including the two-byte Length,
-        // full header, packet number and AEAD tag. Our <=600-byte CRYPTO
-        // fragments always leave room for padding even with 20-byte CIDs.
         const auto header = build_long_header(
           LongPacketType::Initial, peer_id.value_or( original ), config.local_cid, "", *number, 4, 1200 );
         payload.resize( 1200 - header.size() - 16, '\0' );
@@ -462,47 +461,36 @@ struct HandshakeConnection::Impl
                  ? seal_handshake_packet( keys, *peer_id, config.local_cid, *number, 4, payload )
                  : seal_one_rtt_packet( keys, *peer_id, *number, 4, payload );
       }
+      if ( wire.size() != bytes || !budget.record_sent( bytes ) )
+        throw std::logic_error( "QUIC planned packet size mismatch" );
+      amplification_blocked = false;
       std::shared_ptr<RecoveryData> data;
-      if ( retry )
+      if ( retry ) {
+        const auto consumed = recovery.take_pending( kind );
+        if ( !consumed || consumed->data != retry->data )
+          throw std::logic_error( "QUIC recovery selection changed" );
         data = retry->data;
-      else if ( crypto )
+      } else if ( crypto )
         data = std::make_shared<RecoveryData>( *crypto );
       else if ( done )
         data = std::make_shared<RecoveryData>( HandshakeDoneFrame {} );
       else if ( ping )
         data = std::make_shared<RecoveryData>( PingFrame {} );
-      prepared = Prepared { kind,
-                            *number,
-                            std::move( wire ),
-                            crypto ? crypto->data.size() : 0,
-                            done,
-                            ping,
-                            bool( data ),
-                            ack ? std::optional<uint64_t> { ack->generation } : std::nullopt,
-                            std::move( data ) };
+      acks.sent( kind, *number, eliciting );
+      recovery.sent( kind, *number, now_us(), data, bytes, kind == PacketKind::Initial );
+      if ( ack )
+        acks.ack_sent( kind, ack->generation );
+      if ( crypto )
+        offsets[index( kind )] += crypto->data.size();
+      else if ( done )
+        done_pending = false;
+      else if ( ping )
+        ping_pending = false;
+      if ( !config.tls.server && kind == PacketKind::Handshake )
+        clear_initial();
+      return UdpDatagram { peer, std::move( wire ), 0 };
     }
-    if ( !budget.record_sent( prepared->wire.size() ) ) {
-      amplification_blocked = true;
-      return std::nullopt;
-    }
-    amplification_blocked = false;
-    auto output = std::move( *prepared );
-    prepared.reset();
-    acks.sent( output.kind, output.number, output.eliciting );
-    recovery.sent( output.kind, output.number, now_us(), output.data );
-    if ( output.data && output.data->acknowledged )
-      acks.release( output.kind, output.number );
-    if ( output.ack_generation )
-      acks.ack_sent( output.kind, *output.ack_generation );
-    if ( output.crypto_length )
-      offsets[index( output.kind )] += output.crypto_length;
-    else if ( output.done )
-      done_pending = false;
-    else if ( output.ping )
-      ping_pending = false;
-    if ( !config.tls.server && output.kind == PacketKind::Handshake )
-      clear_initial();
-    return UdpDatagram { peer, std::move( output.wire ), 0 };
+    return std::nullopt;
   }
 };
 HandshakeConnection::HandshakeConnection( ConnectionConfig config, UdpEndpoint peer )
@@ -581,6 +569,10 @@ void HandshakeConnection::on_timeout()
 RttEstimator HandshakeConnection::rtt_estimate() const
 {
   return impl_->recovery.rtt();
+}
+CongestionStats HandshakeConnection::congestion_stats() const
+{
+  return impl_->recovery.congestion_stats();
 }
 size_t HandshakeConnection::packets_awaiting_ack( PacketKind kind ) const
 {

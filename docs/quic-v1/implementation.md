@@ -1,6 +1,6 @@
 # QUIC v1 实现讲解（进行中）
 
-代码基准 `7abc5c7`（2026-10-22）。目前基础编码、包保护、CRYPTO/TLS、双栈 UDP 和单路径 `HandshakeConnection` 已贯通；即时 ACK、发送时间、RTT、阈值丢包和有界握手 PTO 已接入连接。**可靠应用流、流量控制、拥塞控制与第三方互通仍未完成。**
+握手恢复基准 `7abc5c7`（2026-10-22），以下包含后续 NewReno 阶段。目前基础编码、包保护、CRYPTO/TLS、双栈 UDP 和单路径 `HandshakeConnection` 已贯通；即时 ACK、发送时间、RTT、阈值丢包和有界握手 PTO 已接入连接；随后加入固定单路径 NewReno 的物理在途字节、窗口及 ACK/PTO 例外。**可靠应用流、流量控制、持续拥塞/pacing/ECN 与第三方互通仍未完成。**
 
 基础工具按下面的手算顺序阅读。整包与状态机专题依次见 [Initial 保护](initial-packet-protection.md)、[Initial 整包](initial-packet.md)、[CRYPTO](crypto-streams.md)、[TLS](tls-handshake.md)、[Handshake/1-RTT 包](protected-packets.md)、[UDP](udp.md)、[连接引擎](handshake-connection.md)、[ACK](acknowledgments.md)、[丢包恢复](loss-recovery.md)。独立的路径/CID/Retry 原语并不表示对应迁移和协商状态机已经接线。
 
@@ -339,9 +339,9 @@ PTO（Probe Timeout）是“等待确认过久时，什么时候尝试发探测�
 | --- | --- | --- |
 | RFC 9000 | 基础编码、核心帧格式、参数/CID 校验、单路径连接、真实双栈 UDP、即时 ACK、有界发送与接收窗口 | 应用流及流量控制、完整角色/方向语义、VN/Retry 接受、迁移、动态路由、PMTU、关闭/空闲计时 |
 | RFC 9001 | Initial/Handshake/1-RTT AES 包保护、CRYPTO、真实 TLS 1.3、证书/ALPN、实际 CID 绑定、握手确认及密钥丢弃 | 其它套件、后握手 TLS、密钥更新/使用上限、会话恢复和 0-RTT |
-| RFC 9002 | 发送时间、ACK 样本筛选、RTT、包号/时间阈值、握手 PTO/退避、迟到 ACK 与共享逻辑帧身份 | 应用流恢复、CRYPTO 发送缓冲按 ACK 回收、拥塞控制、bytes-in-flight、pacing、ECN 验证 |
+| RFC 9002 | 发送时间、ACK 样本筛选、RTT、包号/时间阈值、握手 PTO/退避、迟到 ACK 与共享逻辑帧身份 | 应用流恢复、CRYPTO 发送缓冲按 ACK 回收、持续拥塞、pacing、ECN 验证 |
 
-例如 ACK 现在会对实际已交付包号预检并更新发送历史，但尚无 bytes-in-flight 或拥塞窗口。STREAM 仍只具备线上格式编解码，没有应用字节交付和额度约束。完整目标见 `requirements.md`；当前事实以源码、测试和 `coverage.md` 为准。
+ACK 会对实际已交付包号预检并更新发送历史，物理在途字节及拥塞窗口现由 NewReno 接入。STREAM 仍只具备线上格式编解码，没有应用字节交付和额度约束。完整目标见 `requirements.md`；当前事实以源码、测试和 `coverage.md` 为准。
 
 ## 验证记录与可复现命令
 
@@ -354,7 +354,7 @@ PTO（Probe Timeout）是“等待确认过久时，什么时候尝试发探测�
 | `packet_header` / `retry_integrity` | RFC 9000 §17.2–17.3、RFC 9001 §5.4、§5.8；v1 包型、CID、Length、样本与 Retry 标签 | 已实现受保护包头布局、VN 线上格式、Retry 字段解析与标签验证原语；客户端接受规则和 Retry 状态机尚未实现 |
 | `frame` | RFC 9000 §12.4–12.5、§19.1–19.20；长度、ACK gap、流终点、包类型限制和本地数值界限 | 核心帧线上字段与按包类型放置规则已实现；连接已支持握手/ACK/关闭子集；应用流及其它角色、方向和连接语义仍待完成 |
 | `header_protection` / `initial_packet` | RFC 9001 §5.3–5.4、附录 A.3；样本位置、首字节掩码宽度、整包收发顺序 | 基础操作及单个 Initial 整包已对照 RFC 向量；单路径连接收发已接线，其它套件未实现 |
-| `rtt_estimator` | RFC 9002 §5.3、§6.2.1 与勘误 7539；ACK Delay、更新顺序、PTO | 修正一处变动值更新顺序；恢复模块已接入 ACK 取样和定时器，未实现完整拥塞控制 |
+| `rtt_estimator` | RFC 9002 §5.3、§6.2.1 与勘误 7539；ACK Delay、更新顺序、PTO | 修正一处变动值更新顺序；恢复模块已接入 ACK 取样和定时器，已有 NewReno 基础窗口，未实现持续拥塞/pacing/ECN |
 
 这里的“与对照规则一致”仅指表中列出的基础函数及检查过的输入，不代表完整 RFC 一致性或网络互通。独立审阅没有找到其他能复现的基础函数协议错误。还有一个重要接口约定：`PacketLayout::pn_offset` 是**整个数据报**的下标，而报头掩码函数用 `packet[0]` 当作当前包首字节。处理拼接包时，应先切出 `datagram.substr(packet_start, packet_end - packet_start)`，再将 `pn_offset` 换为 `pn_offset - packet_start`；直接传整个数据报会改错首字节。
 
@@ -371,7 +371,7 @@ ctest --test-dir build --output-on-failure --timeout 30 -j2
 
 代码实现时使用测试先行：先看见缺少接口、缺少 ACK 支持或空载荷缺陷使测试失败，再补实现。独立审查发现的 ACK 取样条件、ACK Delay 上限测试、62 位边界与短包头样本长度问题已修正。本次复核又发现 RTT 变动值与 RFC 9002 勘误的顺序不符：先将断言改为 40 ms，观察到 `quic_packet_primitives` 因得到旧结果 39.6875 ms 而失败；再调整实现顺序，定向测试恢复通过。各里程碑的任务与具体测试范围记录在 `docs/superpowers/plans/2026-10-19-quic-packet-primitives.md`、`2026-10-19-quic-basic-frames.md` 和 `2026-10-19-quic-packet-header.md`。
 
-以上 5/5、41/43 及 CRYPTO 阶段 14/14 是历史记录。最新代码基准 `7abc5c7` 的 QUIC CTest 为 **21/21**，全量为 **52/59**；五项既有超时和两个缺失可执行文件详见 [loss-recovery.md](loss-recovery.md)。本次仅整理文档，没有重新运行 CTest。
+以上 5/5、41/43 及 CRYPTO 阶段 14/14 是历史记录。握手恢复基准 `7abc5c7` 的 QUIC CTest 为 **21/21**，全量为 **52/59**；五项既有超时和两个缺失可执行文件详见 [loss-recovery.md](loss-recovery.md)。NewReno 阶段已运行 QUIC **22/22**、全量 **53/60**；详情见 [congestion-control.md](congestion-control.md)。
 
 ## 自测：能否用自己的话解释
 
@@ -390,3 +390,7 @@ ctest --test-dir build --output-on-failure --timeout 30 -j2
 包号阈值为 3，时间阈值为 `max(1ms, 9/8 × max(latest_rtt, smoothed_rtt))`，均针对比最大已确认包号小的未确认包。PTO 初值 999ms，按全连接指数退避，到期探测不等于宣告所有包丢失。迟到 ACK 可通过近期元数据找到原包及重发副本共享的逻辑交付身份，取消冗余重发；历史淘汰后不保证仍能关联。
 
 每空间活动记录、近期历史和待重发逻辑帧各有 4096 项上限；这些计数不是拥塞窗口。连续三份关键包丢失也有确定性测试，共十种场景。退役幂等、提前计时器回调和服务端恢复地址验证条件的回归详见 [loss-recovery.md](loss-recovery.md)。
+
+## 单路径拥塞窗口
+
+`PacketRecovery` 现在另存物理包的在途字节；共享帧身份已交付，只取消逻辑重发，不删除仍在网络中的副本。NewReno 初始窗口 12000 字节、最小窗口 2400，慢启动按确认字节增长、恢复期减半一次、拥塞避免保留小 ACK 信用。连接在分配包号前检查完整线上大小；窗口满时仍可发纯 ACK 和 PTO 探测，填充 Initial ACK 则计入窗口。详细手算、测试和范围见 [congestion-control.md](congestion-control.md)。

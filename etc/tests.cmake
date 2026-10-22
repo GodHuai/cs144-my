@@ -114,3 +114,5 @@ ttest(quic_handshake_connection)
 ttest(quic_acknowledgments)
 
 ttest(quic_packet_recovery)
+
+ttest(quic_congestion_control)

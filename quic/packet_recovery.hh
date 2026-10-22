@@ -1,5 +1,6 @@
 #pragma once
 
+#include "congestion_control.hh"
 #include "frame.hh"
 #include "packet_number_space.hh"
 #include "rtt_estimator.hh"
@@ -28,13 +29,21 @@ struct RecoveryContext
   uint8_t ack_delay_exponent { 3 };
   std::optional<PacketKind> validation_probe_space {};
 };
-// Single-path recovery foundation, not a congestion controller. All times are
+// Single-path recovery with physical flight accounting and basic NewReno. All times are
 // monotonic microseconds. ACK validity is checked by PacketAcknowledgments first.
 class PacketRecovery
 {
 public:
   using Events = std::array<std::vector<uint64_t>, 3>;
-  void sent( PacketKind kind, uint64_t pn, uint64_t now, std::shared_ptr<RecoveryData> data );
+  void sent( PacketKind kind,
+             uint64_t pn,
+             uint64_t now,
+             std::shared_ptr<RecoveryData> data,
+             uint64_t bytes = 0,
+             bool padded = false );
+  bool can_send( PacketKind kind, uint64_t bytes, bool eliciting, bool padded, bool probe = false ) const;
+  CongestionStats congestion_stats() const { return congestion_.stats(); }
+  std::optional<RecoverySend> pending( PacketKind kind );
   std::vector<uint64_t> acknowledged( PacketKind kind,
                                       const AckFrame& ack,
                                       uint64_t now,
@@ -53,6 +62,12 @@ private:
   };
   struct Space
   {
+    struct Flight
+    {
+      uint64_t time, bytes;
+      bool eliciting;
+    };
+    std::map<uint64_t, Flight> flight {};
     std::map<uint64_t, Record> active {}, recent {};
     std::deque<RecoverySend> pending {};
     std::optional<uint64_t> largest_acked {};
@@ -60,6 +75,7 @@ private:
   };
   std::array<Space, 3> spaces_ {};
   RttEstimator rtt_ {};
+  NewReno congestion_ {};
   unsigned pto_count_ {};
   std::optional<uint64_t> validation_anchor_ {};
   std::weak_ptr<RecoveryData> pending_probe_ {};

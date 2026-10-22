@@ -43,11 +43,22 @@ void PacketRecovery::enqueue( Space& s, const std::shared_ptr<RecoveryData>& dat
   data->queued = true;
   s.pending.push_back( { data, probe } );
 }
-void PacketRecovery::sent( PacketKind kind, uint64_t pn, uint64_t now, std::shared_ptr<RecoveryData> data )
+void PacketRecovery::sent( PacketKind kind,
+                           uint64_t pn,
+                           uint64_t now,
+                           std::shared_ptr<RecoveryData> data,
+                           uint64_t bytes,
+                           bool padded )
 {
   auto& s = space( kind );
   if ( s.active.contains( pn ) || s.recent.contains( pn ) || pn >= max_packet_number )
     throw std::logic_error( "invalid recovery send record" );
+  if ( bytes && ( data || padded ) ) {
+    if ( s.flight.size() >= 4096 )
+      throw std::length_error( "QUIC physical flight history full" );
+    congestion_.sent( bytes );
+    s.flight.emplace( pn, Space::Flight { now, bytes, bool( data ) } );
+  }
   if ( data && data->acknowledged ) {
     data->queued = false;
     remember( s, pn, { now, std::move( data ) } );
@@ -76,12 +87,25 @@ std::optional<uint64_t> PacketRecovery::loss_time( const Space& s ) const
     const auto due = add( record.time, loss_delay() );
     result = result ? std::min( *result, due ) : due;
   }
+  for ( const auto& [pn, flight] : s.flight ) {
+    if ( pn >= *s.largest_acked )
+      break;
+    const auto due = add( flight.time, loss_delay() );
+    result = result ? std::min( *result, due ) : due;
+  }
   return result;
 }
 void PacketRecovery::detect_lost( Space& s, uint64_t now, std::vector<uint64_t>& released )
 {
   if ( !s.largest_acked )
     return;
+  for ( auto i = s.flight.begin(); i != s.flight.end() && i->first < *s.largest_acked; ) {
+    if ( *s.largest_acked - i->first >= 3 || add( i->second.time, loss_delay() ) <= now ) {
+      congestion_.lost( i->second.bytes, i->second.time, now );
+      i = s.flight.erase( i );
+    } else
+      ++i;
+  }
   for ( auto i = s.active.begin(); i != s.active.end() && i->first < *s.largest_acked; ) {
     if ( *s.largest_acked - i->first >= 3 || add( i->second.time, loss_delay() ) <= now ) {
       enqueue( s, i->second.data, false );
@@ -107,11 +131,20 @@ std::vector<uint64_t> PacketRecovery::acknowledged( PacketKind kind,
     largest_time = i->second.time;
   else if ( auto j = s.recent.find( largest ); j != s.recent.end() )
     largest_time = j->second.time;
+  const auto stats = congestion_.stats();
+  const bool limited = stats.bytes_in_flight < stats.window && stats.window - stats.bytes_in_flight >= 1200;
+  std::vector<Space::Flight> newly_acked_flight;
   bool new_eliciting = false, any_new = false;
   std::vector<uint64_t> released;
   for ( const auto& range : ack.ranges ) {
     if ( range.smallest > range.largest )
       throw std::invalid_argument( "invalid recovery ACK range" );
+    auto physical = s.flight.lower_bound( range.smallest );
+    while ( physical != s.flight.end() && physical->first <= range.largest ) {
+      newly_acked_flight.push_back( physical->second );
+      any_new = true;
+      physical = s.flight.erase( physical );
+    }
     for ( auto* records : { &s.active, &s.recent } ) {
       auto i = records->lower_bound( range.smallest );
       while ( i != records->end() && i->first <= range.largest ) {
@@ -149,6 +182,8 @@ std::vector<uint64_t> PacketRecovery::acknowledged( PacketKind kind,
       ++i;
   }
   detect_lost( s, now, released );
+  for ( const auto& flight : newly_acked_flight )
+    congestion_.acknowledged( flight.bytes, flight.time, limited );
   return released;
 }
 std::optional<std::pair<uint64_t, PacketKind>> PacketRecovery::pto( const RecoveryContext& c ) const
@@ -161,7 +196,9 @@ std::optional<std::pair<uint64_t, PacketKind>> PacketRecovery::pto( const Recove
   bool any_active = false;
   for ( auto kind : kinds ) {
     const auto& s = space( kind );
-    if ( s.active.empty() )
+    const bool physical_eliciting
+      = std::any_of( s.flight.begin(), s.flight.end(), []( const auto& entry ) { return entry.second.eliciting; } );
+    if ( s.active.empty() && !physical_eliciting )
       continue;
     any_active = true;
     auto period = rtt_.pto_ms( kind == PacketKind::OneRtt, c.confirmed, c.max_ack_delay_ms );
@@ -226,8 +263,30 @@ PacketRecovery::Events PacketRecovery::timeout( uint64_t now, const RecoveryCont
   pto_count_ = std::min( pto_count_ + 1, 63U );
   return events;
 }
+bool PacketRecovery::can_send( PacketKind kind, uint64_t bytes, bool eliciting, bool padded, bool probe ) const
+{
+  if ( !eliciting && !padded )
+    return true;
+  return space( kind ).flight.size() < 4096 && congestion_.can_send( bytes, probe );
+}
+std::optional<RecoverySend> PacketRecovery::pending( PacketKind kind )
+{
+  auto& s = space( kind );
+  std::erase_if( s.pending, []( const auto& p ) {
+    if ( !p.data->acknowledged )
+      return false;
+    p.data->queued = false;
+    return true;
+  } );
+  // PTO work must not sit behind congestion-blocked retransmissions.
+  const auto probe = std::find_if( s.pending.begin(), s.pending.end(), []( const auto& p ) { return p.probe; } );
+  if ( probe != s.pending.end() && probe != s.pending.begin() )
+    std::rotate( s.pending.begin(), probe, std::next( probe ) );
+  return s.pending.empty() ? std::nullopt : std::optional<RecoverySend> { s.pending.front() };
+}
 std::optional<RecoverySend> PacketRecovery::take_pending( PacketKind kind )
 {
+  (void)pending( kind );
   auto& s = space( kind );
   while ( !s.pending.empty() ) {
     auto out = std::move( s.pending.front() );
@@ -249,6 +308,10 @@ void PacketRecovery::discard( PacketKind kind )
     }
   for ( auto& p : s.pending )
     p.data->queued = false;
+  for ( const auto& [pn, flight] : s.flight ) {
+    (void)pn;
+    congestion_.discard( flight.bytes );
+  }
   s = Space {};
   if ( kind == PacketKind::Initial || kind == PacketKind::Handshake )
     pto_count_ = 0;

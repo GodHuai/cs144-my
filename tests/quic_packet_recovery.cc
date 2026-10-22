@@ -143,6 +143,59 @@ void early_loss_timer_callback()
   r.timeout( *loss_due - 1, c );
   require( !r.take_pending( PacketKind::Handshake ), "early loss callback incorrectly fired suppressed PTO" );
 }
+void physical_flight()
+{
+  PacketRecovery r;
+  RecoveryContext c;
+  c.confirmed = c.peer_validated = true;
+  auto data = ping();
+  r.sent( PacketKind::OneRtt, 0, 0, data, 1200 );
+  r.sent( PacketKind::OneRtt, 1, 1, data, 1200 );
+  r.acknowledged( PacketKind::OneRtt, ack( 0, 0 ), 100001, c );
+  require( data->acknowledged && r.congestion_stats().bytes_in_flight == 1200,
+           "logical delivery removed physical retransmission" );
+  r.acknowledged( PacketKind::OneRtt, ack( 1, 1 ), 100002, c );
+  require( r.congestion_stats().bytes_in_flight == 0, "physical retransmit ACK not released" );
+  r.sent( PacketKind::Initial, 0, 200000, nullptr, 1200, true );
+  r.sent( PacketKind::OneRtt, 2, 200001, nullptr, 30 );
+  require( r.congestion_stats().bytes_in_flight == 1200, "padding/pure ACK flight distinction" );
+  require( !r.deadline( c ), "padded ACK-only armed PTO" );
+  r.discard( PacketKind::Initial );
+  require( r.congestion_stats().bytes_in_flight == 0 && r.congestion_stats().window == 12000,
+           "discard debited twice or changed window" );
+  r.discard( PacketKind::Initial );
+
+  PacketRecovery loss;
+  for ( uint64_t pn = 0; pn < 4; ++pn )
+    loss.sent( PacketKind::Handshake, pn, pn, ping(), 1200 );
+  loss.acknowledged( PacketKind::Handshake, ack( 3, 3 ), 100003, c );
+  require( loss.congestion_stats().bytes_in_flight == 2400 && loss.congestion_stats().window == 6000,
+           "packet loss congestion event" );
+  loss.acknowledged( PacketKind::Handshake, ack( 0, 0 ), 100004, c );
+  require( loss.congestion_stats().bytes_in_flight == 2400 && loss.congestion_stats().window == 6000,
+           "late lost ACK changed physical flight or cwnd" );
+  loss.discard( PacketKind::Handshake );
+  require( loss.congestion_stats().bytes_in_flight == 0, "space discard leaked flight" );
+
+  PacketRecovery redundant;
+  auto shared = ping();
+  redundant.sent( PacketKind::OneRtt, 0, 0, shared, 1200 );
+  redundant.sent( PacketKind::OneRtt, 1, 1, shared, 1200 );
+  redundant.sent( PacketKind::OneRtt, 4, 2, nullptr, 30 );
+  redundant.acknowledged( PacketKind::OneRtt, AckFrame { 0, { { 4, 4 }, { 0, 0 } }, std::nullopt }, 100002, c );
+  require( redundant.congestion_stats().bytes_in_flight == 0 && redundant.congestion_stats().window == 6000,
+           "physically lost redundant copy was hidden by logical delivery" );
+  require( !redundant.take_pending( PacketKind::OneRtt ), "delivered redundant loss queued retransmission" );
+
+  PacketRecovery bounded;
+  for ( uint64_t pn = 0; pn < 4096; ++pn )
+    bounded.sent( PacketKind::Initial, pn, pn, nullptr, 1200, true );
+  require( !bounded.can_send( PacketKind::Initial, 1200, true, true, true ),
+           "probe bypassed physical metadata capacity" );
+  require( bounded.can_send( PacketKind::Initial, 30, false, false ), "capacity blocked pure ACK" );
+  bounded.discard( PacketKind::Initial );
+  require( bounded.congestion_stats().bytes_in_flight == 0, "capacity discard leaked bytes" );
+}
 }
 int main()
 {
@@ -151,6 +204,7 @@ int main()
     losses_and_probes();
     late_delivery_and_backoff();
     early_loss_timer_callback();
+    physical_flight();
   } catch ( const std::exception& e ) {
     std::cerr << e.what() << '\n';
     return 1;

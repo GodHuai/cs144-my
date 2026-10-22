@@ -10,16 +10,16 @@ ACK 尽量与同级 CRYPTO 或控制帧一起发送，否则独立发包；当�
 
 ## 已发送上界与活动记录
 
-发送记录只在 `poll_transmit()` 真正交付数据报时更新。反放大暂停的 Prepared 包不算已发送。各空间实际交付的包号连续，故最高已交付包号足以检查 ACK 是否确认未发送包。整个包内所有 ACK 先预检，再更新记录，重复 ACK 幂等。Prepared ACK 使用接收 generation，防止旧快照清掉暂停期间新收到包的待确认状态。
+发送记录只在 `poll_transmit()` 真正交付数据报时更新。反放大或拥塞暂停的候选包不算已发送；当前只在通过门控后分配包号。各空间实际交付的包号连续，故最高已交付包号足以检查 ACK 是否确认未发送包。整个包内所有 ACK 先预检，再更新记录，重复 ACK 幂等。ACK 使用接收 generation 标记已交付快照；阻塞后重新选择最新 ACK，不保留旧 Prepared 密文。
 
 每空间最多记录 4096 个活动、会触发 ACK 的包号。达到上限时暂停新 CRYPTO/PING/HANDSHAKE_DONE，包括恢复探测，仍允许 ACK-only 输出。ACK 模块不逐包保存 ACK-only；恢复模块另行保存近期发送时间，因此最大新确认包即使为 ACK-only，也可能用于 RTT 采样。详见 [loss-recovery.md](loss-recovery.md)。
 
-`packets_awaiting_ack(kind)` 返回活动包数量；记录会因 ACK、声明丢失或同一逻辑帧的其他副本交付而释放，所以它不是字节在途或拥塞窗口。密钥退役和连接终止也会清理记录。
+`packets_awaiting_ack(kind)` 返回活动包数量；记录会因 ACK、声明丢失或同一逻辑帧的其他副本交付而释放，所以它不是字节在途或拥塞窗口。物理字节与窗口由 `congestion_stats()` 单独提供，见 [congestion-control.md](congestion-control.md)。密钥退役和连接终止也会清理记录。
 
 ## 测试和剩余边界
 
 `tests/quic_acknowledgments.cc` 覆盖区间合并、稀疏范围上限、独立空间、ACK Delay、重复/旧包、发送容量与释放、ACK 幂等及未发送包拒绝。连接测试解密检查 Initial ACK，验证受保护握手、双向 PING、重复包重新确认、坏标签丢弃、ACK-only 静止和 IPv4/IPv6 UDP 回环。
 
-RTT、发送时间、阈值丢包和握手 PTO 已实现；仍缺 CRYPTO 发送缓冲按 ACK 回收、可靠应用流、拥塞控制、ACK_ECN 验证与 ACK 频率协商。恢复只保证现有有界测试场景，不能据此宣称完整可靠传输。
+RTT、发送时间、阈值丢包和握手 PTO 已实现；NewReno 基础窗口已接入；仍缺 CRYPTO 发送缓冲按 ACK 回收、可靠应用流、持续拥塞/pacing/ECN 验证与 ACK 频率协商。恢复只保证现有有界测试场景，不能据此宣称完整可靠传输。
 
-最近代码基准 `7abc5c7` 的验证记录为 QUIC CTest 21/21、全量 52/59；失败项目及恢复测试范围见 [loss-recovery.md](loss-recovery.md)。这是代码里程碑记录，本次文档整理未重新运行 CTest。
+握手恢复基准 `7abc5c7` 的验证记录为 QUIC CTest 21/21、全量 52/59；失败项目及恢复测试范围见 [loss-recovery.md](loss-recovery.md)。后续 NewReno 阶段验证为 QUIC 22/22、全量 53/60，见 [congestion-control.md](congestion-control.md)。
