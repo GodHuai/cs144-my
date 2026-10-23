@@ -256,7 +256,7 @@ ack.ranges.push_back( AckRange { range_largest - *length, range_largest } );
 
 `PATH_CHALLENGE` (`1a`) 与 `PATH_RESPONSE` (`1b`) 各带**恰好八字节**不透明数据。解析器只读出这八字节；未来收到挑战时，连接层要用同样的数据回复，并结合发送路径判断验证是否成功。`HANDSHAKE_DONE` (`1e`) 没有字段，只有服务端在完成握手后可发送；仅解析出它并不意味着可以提前确认握手。[RFC 9000 §19.17–19.20](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.17)
 
-`CONNECTION_CLOSE` 有两种**不同布局**：传输错误 `1c` 是“错误码、触发它的帧类型、原因长度、原因字节”；应用错误 `1d` 删去“触发帧类型”。例如 `1c 0a 08 03 62 61 64` 表示传输错误码 10、触发帧类型 8、三字节原因 `bad`。`1d 25 00` 表示应用错误码 37、空原因。源码用 `frame_type` 是否存在与 `application` 标志相互校验，防止编码出错位的字段；解码时以线上类型决定是否读取该字段。原因长度按**字节数**计算，可以为零，规范建议原因文本使用 UTF-8，但本层只保留字节，尚未实现文字验证；连接已有对端关闭进入 Draining 的处理，但完整关闭计时及主动错误关闭仍缺失。[RFC 9000 §19.19](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.19)
+`CONNECTION_CLOSE` 有两种**不同布局**：传输错误 `1c` 是“错误码、触发它的帧类型、原因长度、原因字节”；应用错误 `1d` 删去“触发帧类型”。例如 `1c 0a 08 03 62 61 64` 表示传输错误码 10、触发帧类型 8、三字节原因 `bad`。`1d 25 00` 表示应用错误码 37、空原因。源码用 `frame_type` 是否存在与 `application` 标志相互校验，防止编码出错位的字段；解码时以线上类型决定是否读取该字段。原因长度按**字节数**计算，可以为零，规范建议原因文本使用 UTF-8，但本层只保留字节，尚未实现文字验证；连接已有对端关闭进入 Draining 的处理；应用关闭与 idle/closing/draining 计时已接入，见 connection-lifecycle.md，主动错误关闭仍缺失。[RFC 9000 §19.19](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.19)
 
 解析器对 CID、路径数据和重置令牌使用“先确认剩余长度，再读取固定字节数”的做法；对令牌与原因使用显式长度与 `read_data()`。如果完整明文载荷中任何一帧截断，就返回 `std::nullopt`，避免把前面已读出的帧误交给连接层。测试包含合法相邻帧、空令牌、CID 长度 0 或 21、退休阈值倒置、重置令牌缺字节、路径数据缺字节，以及两种关闭帧原因截断。
 
@@ -337,7 +337,7 @@ PTO（Probe Timeout）是“等待确认过久时，什么时候尝试发探测�
 
 | 规范范围 | 已有的可调用代码 | 必须继续实现的内容 |
 | --- | --- | --- |
-| RFC 9000 | 基础编码、核心帧格式、参数/CID 校验、单路径连接、真实双栈 UDP、即时 ACK、有界发送与接收窗口 | 完整角色/方向语义、VN/Retry 接受、迁移、动态路由、PMTU、关闭/空闲计时 |
+| RFC 9000 | 基础编码、核心帧格式、参数/CID 校验、单路径连接、真实双栈 UDP、即时 ACK、有界发送与接收窗口 | 完整角色/方向语义、VN/Retry 接受、迁移、动态路由、PMTU、错误关闭调度 |
 | RFC 9001 | Initial/Handshake/1-RTT AES 包保护、CRYPTO、真实 TLS 1.3、证书/ALPN、实际 CID 绑定、握手确认及密钥丢弃 | 其它套件、后握手 TLS、密钥更新/使用上限、会话恢复和 0-RTT |
 | RFC 9002 | 发送时间、ACK 样本筛选、RTT、包号/时间阈值、握手 PTO/退避、迟到 ACK 与共享逻辑帧身份 | CRYPTO 发送缓冲按 ACK 回收、持续拥塞、ECN 验证 |
 
@@ -400,3 +400,5 @@ ctest --test-dir build --output-on-failure --timeout 30 -j2
 后续已接入有界可靠应用流、FIN/RESET/STOP 与流量控制，当前能力、API、资源限制和验证见 [application-streams.md](application-streams.md)。
 
 后续已实现流终态回收、紧凑关闭 ID 区间与可靠 MAX_STREAMS 补额，最新语义和验证见 [stream-retirement.md](stream-retirement.md)。
+
+本轮补上应用主动关闭、Closing/Draining 到期释放及协商 idle 超时，最新接口、范围和验证见 [connection-lifecycle.md](connection-lifecycle.md)。

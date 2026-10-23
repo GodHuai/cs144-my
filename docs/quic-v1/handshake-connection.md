@@ -24,13 +24,13 @@
 
 客户端在首次交付 Handshake 包时、服务端在认证收到 Handshake 包时丢弃 Initial 密钥和相应 CRYPTO。两端在确认握手时清除 Handshake 读写 secret 与 CRYPTO，保留应用密钥。退役同时清理该空间的 ACK 与恢复状态，且是幂等的，不会因重复事件再次重置 PTO 退避。TLS 新增的 `discard_keys()` 只供达到上述里程碑且 TLS 已释放旧级别输入的连接调用，不允许以此接口丢弃 OneRtt。
 
-合法的对端关闭进入 Draining，停止输出；本轮没有 draining 定时器。认证帧错误或 TLS 失败进入 Failed，首个错误保持不变，清理 TLS、输出和待解密队列。尚未实现向对端调度错误 CONNECTION_CLOSE。
+合法的对端关闭进入 Draining，停止输出并按 3 PTO 到期；应用主动关闭与空闲计时见 [connection-lifecycle.md](connection-lifecycle.md)。认证帧错误或 TLS 失败进入 Failed，首个错误保持不变，清理 TLS、输出和待解密队列。尚未实现向对端调度错误 CONNECTION_CLOSE。
 
 ## 当前支持范围
 
 支持握手 CRYPTO、PADDING、PING、HANDSHAKE_DONE 和对端关闭。ACK 已接入生成与发送记录更新，详见 [acknowledgments.md](acknowledgments.md)；RTT、握手帧重传和 PTO 现已接入，见 [loss-recovery.md](loss-recovery.md)；单路径 NewReno 物理字节/窗口见 [congestion-control.md](congestion-control.md)，持续拥塞和 ECN 验证仍缺失。`send_ping()` 最多保留一个待发 PING。
 
-STREAM 和流量控制现已接入有界应用接口；连接 ID 生命周期、路径控制及其它未实现语义不会被交给应用，认证后遇到它们以本地 INTERNAL_ERROR (`0x01`) 结束；这不表示它们本身都是对端协议违规。后握手 CRYPTO 和密钥更新也尚不支持。该类不接受 Retry、0-RTT、版本协商或 TLS 会话恢复，不提供监听器、动态多连接分发、空闲超时及外部互通保证。
+STREAM 和流量控制现已接入有界应用接口；连接 ID 生命周期、路径控制及其它未实现语义不会被交给应用，认证后遇到它们以本地 INTERNAL_ERROR (`0x01`) 结束；这不表示它们本身都是对端协议违规。后握手 CRYPTO 和密钥更新也尚不支持。该类不接受 Retry、0-RTT、版本协商或 TLS 会话恢复，不提供监听器、动态多连接分发及外部互通保证。
 
 ## 测试
 
@@ -49,3 +49,5 @@ ctest --test-dir build --output-on-failure --timeout 30 -j2
 后续已接入有界令牌桶 pacing：速率随窗口与 RTT 调整，发送唤醒与恢复期限合并，纯 ACK/PTO 探测保留例外。当前实现与验证见 [pacing.md](pacing.md)。
 
 后续已接入有界可靠应用流、FIN/RESET/STOP 与流量控制，当前能力、API、资源限制和验证见 [application-streams.md](application-streams.md)。
+
+本轮补上应用主动关闭、Closing/Draining 到期释放及协商 idle 超时，最新接口、范围和验证见 [connection-lifecycle.md](connection-lifecycle.md)。

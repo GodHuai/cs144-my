@@ -62,3 +62,5 @@
 后续已接入有界可靠应用流、FIN/RESET/STOP 与流量控制，当前能力、API、资源限制和验证见 [application-streams.md](application-streams.md)。
 
 后续已实现流终态回收、紧凑关闭 ID 区间与可靠 MAX_STREAMS 补额，最新语义和验证见 [stream-retirement.md](stream-retirement.md)。
+
+本轮补上应用主动关闭、Closing/Draining 到期释放及协商 idle 超时，最新接口、范围和验证见 [connection-lifecycle.md](connection-lifecycle.md)。

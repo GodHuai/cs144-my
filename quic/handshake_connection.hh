@@ -25,7 +25,9 @@ enum class ConnectionState
   Handshaking,
   Established,
   Confirmed,
+  Closing,
   Draining,
+  Closed,
   Failed
 };
 enum class ConnectionReceive
@@ -36,9 +38,9 @@ enum class ConnectionReceive
 };
 
 // Single-threaded, single pinned UDP peer; reusable sans-I/O handshake engine.
-// Bounded reliable streams, flow control, recovery, NewReno and pacing; no listener, migration or
-// close timers yet. It is not a complete QUIC transport. Caller provides random
-// 8..20-byte CIDs and dispatches datagrams to the appropriate connection.
+// Bounded reliable streams, recovery, NewReno, pacing and close/idle timers; no listener or migration. It is not a
+// complete QUIC transport. Caller provides random 8..20-byte CIDs and dispatches datagrams to the appropriate
+// connection.
 class HandshakeConnection
 {
 public:
@@ -55,6 +57,9 @@ public:
   RttEstimator rtt_estimate() const;
   CongestionStats congestion_stats() const;
   size_t packets_awaiting_ack( PacketKind kind ) const;
+  // Application close after TLS completion. Reason is bounded to 256 bytes.
+  // Reject invalid inputs or a terminal connection without changing its close reason.
+  bool close( uint64_t application_error = 0, std::string_view reason = {} );
   bool send_ping(); // One bounded pending PING, only after TLS completion.
   // Application operations require TLS completion; absent stream credits default to zero.
   std::optional<uint64_t> open_stream( bool unidirectional );
@@ -65,6 +70,8 @@ public:
   bool stop_sending( uint64_t id, uint64_t error );
   size_t stream_send_buffered() const;
   ConnectionState state() const;
+  // Local requested close or authenticated peer close; retained for application diagnostics.
+  std::optional<ConnectionCloseFrame> close_info() const;
   std::optional<uint64_t> transport_error() const;
   std::string peer_cid() const;
   std::optional<TransportParameters> peer_parameters() const;

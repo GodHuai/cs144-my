@@ -126,3 +126,5 @@ ttest(quic_stream_connection)
 add_test(NAME quic_stream_retirement COMMAND quic_stream_connection_sanitized retirement)
 set_property(TEST quic_stream_retirement PROPERTY FIXTURES_REQUIRED compile)
 set_property(TEST quic_stream_retirement PROPERTY TIMEOUT 30)
+
+ttest(quic_connection_lifecycle)

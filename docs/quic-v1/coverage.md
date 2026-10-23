@@ -6,7 +6,7 @@
 
 | 规范 | 主题 | 任务 | 状态 |
 | --- | --- | --- | --- |
-| RFC 9000 §5–8、RFC 9001 §4 | 单路径握手连接编排 | 3–4 | 部分实现：`quic/handshake_connection.*` 接管实际 CID/TLS 绑定、三空间、认证和完整帧预检、待密钥队列、反放大、握手确认及 Initial/Handshake 密钥丢弃；真实 IPv4/IPv6 测试使用库中连接类。即时 ACK 和有界发送记录已接线；握手阈值恢复/RTT/PTO 已接线，见 `loss-recovery.md`；NewReno 基础窗口已接入；持续拥塞/ECN、监听与关闭计时待完成，详见 `handshake-connection.md` |
+| RFC 9000 §5–8、RFC 9001 §4 | 单路径握手连接编排 | 3–4 | 部分实现：`quic/handshake_connection.*` 接管实际 CID/TLS 绑定、三空间、认证和完整帧预检、待密钥队列、反放大、握手确认及 Initial/Handshake 密钥丢弃；真实 IPv4/IPv6 测试使用库中连接类。即时 ACK 和有界发送记录已接线；握手阈值恢复/RTT/PTO 已接线，见 `loss-recovery.md`；NewReno 基础窗口已接入；持续拥塞/ECN、监听与错误关闭调度待完成；应用关闭及 idle/closing/draining 计时见 connection-lifecycle.md，详见 `handshake-connection.md` |
 | UDP / RFC 9000 §13.4、§14 | IPv4/IPv6 数据报与 ECN 元数据 | 1 | 部分实现：`quic/udp_socket.*` 提供 Linux 非阻塞收发、逐包 ECN、scope、截断丢弃；`tests/quic_udp_handshake.cc` 通过真实双栈 UDP 运行受保护 TLS 与 1-RTT 控制帧。监听器与动态多连接路由、ACK_ECN/拥塞验证、PMTU 与外部互通待实现。详见 `udp.md` |
 | RFC 9000 §7.5、§19.6 | CRYPTO 字节缓冲与分片 | 3 | 部分实现：每级别至少 4096 字节的乱序缓冲、62 位 offset 界限、唯一字节容量记账和原子错误、发送重分片及级别丢弃见 `quic/crypto_streams.*`。TLS 握手接线见 `quic/tls_handshake.*`；ACK/握手丢包调度已由连接接入；错误到 CONNECTION_CLOSE 和发送缓冲按 ACK 回收待完成 |
 | RFC 9000 §2–4 | 流、状态与流量控制 | 4–5 | 部分实现：可靠双向/单向字节传输、重组、FIN/RESET/STOP、流/连接额度、MAX/BLOCKED 已接入；有界缓冲、终态回收和 MAX_STREAMS 补额已接入；仍需完整边界审计。见 [application-streams.md](application-streams.md) |
@@ -29,3 +29,5 @@
 后续已接入有界可靠应用流、FIN/RESET/STOP 与流量控制，当前能力、API、资源限制和验证见 [application-streams.md](application-streams.md)。
 
 后续已实现流终态回收、紧凑关闭 ID 区间与可靠 MAX_STREAMS 补额，最新语义和验证见 [stream-retirement.md](stream-retirement.md)。
+
+本轮补上应用主动关闭、Closing/Draining 到期释放及协商 idle 超时，最新接口、范围和验证见 [connection-lifecycle.md](connection-lifecycle.md)。

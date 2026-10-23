@@ -7,8 +7,11 @@
 #include "packet_number_space.hh"
 #include "packet_recovery.hh"
 #include "protected_packet.hh"
+#include "varint.hh"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <limits>
 
 #include <array>
 #include <deque>
@@ -35,7 +38,12 @@ bool ack_eliciting( const Frame& frame )
 }
 bool terminal( ConnectionState state )
 {
-  return state == ConnectionState::Failed || state == ConnectionState::Draining;
+  return state == ConnectionState::Failed || state == ConnectionState::Draining || state == ConnectionState::Closing
+         || state == ConnectionState::Closed;
+}
+uint64_t add_time( uint64_t base, uint64_t interval )
+{
+  return base + std::min( interval, std::numeric_limits<uint64_t>::max() - base );
 }
 }
 struct HandshakeConnection::Impl
@@ -44,6 +52,14 @@ struct HandshakeConnection::Impl
   UdpEndpoint peer;
   ConnectionState state;
   std::optional<uint64_t> error {};
+  std::optional<ConnectionCloseFrame> closing_info {};
+  std::optional<uint64_t> end_deadline {};
+  std::string close_wire {};
+  uint64_t attributed_received {}, close_sent {}, close_response_after {}, close_interval {};
+  bool close_pending {};
+  uint64_t last_activity {};
+  bool idle_send_reset = true;
+
   std::optional<std::string> peer_id {};
   std::string original {};
   std::optional<InitialKeys> initial {};
@@ -91,6 +107,53 @@ struct HandshakeConnection::Impl
     }
     return c;
   }
+  uint64_t base_pto_us() const
+  {
+    const auto context = recovery_context();
+    const double ms
+      = recovery.rtt().pto_ms( context.confirmed, context.confirmed, context.max_ack_delay_ms ).value();
+    const auto us = std::ceil( ms * 1000 );
+    return us >= static_cast<double>( std::numeric_limits<uint64_t>::max() ) ? std::numeric_limits<uint64_t>::max()
+                                                                             : static_cast<uint64_t>( us );
+  }
+  uint64_t three_pto_us() const
+  {
+    const auto pto = base_pto_us();
+    return pto > std::numeric_limits<uint64_t>::max() / 3 ? std::numeric_limits<uint64_t>::max() : 3 * pto;
+  }
+  std::optional<uint64_t> idle_deadline() const
+  {
+    if ( terminal( state ) )
+      return std::nullopt;
+    auto ms = transport_parameter_integer( config.tls.local_parameters, 0x01 ).value_or( 0 );
+    if ( tls ) {
+      if ( const auto parameters = tls->peer_parameters() ) {
+        const auto peer_ms = transport_parameter_integer( *parameters, 0x01 ).value_or( 0 );
+        if ( peer_ms && ( !ms || peer_ms < ms ) )
+          ms = peer_ms;
+      }
+    }
+    if ( !ms )
+      return std::nullopt;
+    const auto us
+      = ms > std::numeric_limits<uint64_t>::max() / 1000 ? std::numeric_limits<uint64_t>::max() : ms * 1000;
+    return add_time( last_activity, std::max( us, three_pto_us() ) );
+  }
+  bool expire( uint64_t now )
+  {
+    if ( end_deadline && now >= *end_deadline ) {
+      state = ConnectionState::Closed;
+      end_deadline.reset();
+      close_wire.clear();
+      close_pending = false;
+      return true;
+    }
+    if ( const auto idle = idle_deadline(); idle && now >= *idle ) {
+      stop( ConnectionState::Closed );
+      return true;
+    }
+    return state == ConnectionState::Closed;
+  }
   void release_records( PacketKind kind, const std::vector<uint64_t>& numbers_to_release )
   {
     for ( const auto number : numbers_to_release )
@@ -123,8 +186,11 @@ struct HandshakeConnection::Impl
   {
     if ( terminal( state ) )
       return;
+    if ( target == ConnectionState::Draining || target == ConnectionState::Closing )
+      end_deadline = add_time( now_us(), three_pto_us() );
     state = target;
     error = code;
+    pacing_wakeup.reset();
     clear_initial();
     tls.reset();
     streams.reset();
@@ -157,6 +223,7 @@ struct HandshakeConnection::Impl
     , state( config.tls.server ? ConnectionState::WaitingInitial : ConnectionState::Handshaking )
     , budget( config.tls.server ? AmplificationRole::Responder : AmplificationRole::Initiator )
   {
+    last_activity = now_us();
     ApplicationStreams::validate_local( config.tls.local_parameters );
     if ( config.local_cid.size() < 8 || config.local_cid.size() > 20
          || ( !config.tls.server && ( config.initial_dcid.size() < 8 || config.initial_dcid.size() > 20 ) )
@@ -308,8 +375,11 @@ struct HandshakeConnection::Impl
     }
     if ( !preflight( *frames, kind ) )
       return ConnectionReceive::Failed;
+    last_activity = now_us();
+    idle_send_reset = true;
     for ( const auto& frame : *frames ) {
-      if ( std::holds_alternative<ConnectionCloseFrame>( frame ) ) {
+      if ( const auto* close = std::get_if<ConnectionCloseFrame>( &frame ) ) {
+        closing_info = *close;
         stop( ConnectionState::Draining );
         return ConnectionReceive::Processed;
       }
@@ -387,6 +457,22 @@ struct HandshakeConnection::Impl
   std::optional<UdpDatagram> transmit()
   {
     pacing_wakeup.reset();
+    const auto tick = now_us();
+    if ( expire( tick ) )
+      return std::nullopt;
+    if ( state == ConnectionState::Closing ) {
+      const auto cap = attributed_received > std::numeric_limits<uint64_t>::max() / 3
+                         ? std::numeric_limits<uint64_t>::max()
+                         : 3 * attributed_received;
+      if ( !close_pending || close_wire.size() > cap - std::min( cap, close_sent )
+           || !budget.record_sent( close_wire.size() ) )
+        return std::nullopt;
+      close_sent = add_time( close_sent, close_wire.size() );
+      close_pending = false;
+      close_response_after = add_time( tick, close_interval );
+      close_interval = add_time( close_interval, close_interval );
+      return UdpDatagram { peer, close_wire, 0 };
+    }
     if ( terminal( state ) || !tls )
       return std::nullopt;
     const auto exponent
@@ -534,6 +620,10 @@ struct HandshakeConnection::Impl
         data = std::make_shared<RecoveryData>( *app );
       acks.sent( kind, *number, eliciting );
       recovery.sent( kind, *number, now, data, bytes, kind == PacketKind::Initial );
+      if ( eliciting && idle_send_reset ) {
+        last_activity = now;
+        idle_send_reset = false;
+      }
       if ( eliciting || kind == PacketKind::Initial )
         pacer.sent( now, bytes, window, rtt_us );
       if ( app )
@@ -560,7 +650,14 @@ HandshakeConnection::~HandshakeConnection() = default;
 ConnectionReceive HandshakeConnection::receive( const UdpDatagram& datagram )
 {
   auto& self = *impl_;
-  if ( terminal( self.state ) )
+  try {
+    if ( self.expire( self.now_us() ) )
+      return ConnectionReceive::Discarded;
+  } catch ( ... ) {
+    self.stop( ConnectionState::Failed, 0x01 );
+    return ConnectionReceive::Failed;
+  }
+  if ( terminal( self.state ) && self.state != ConnectionState::Closing )
     return self.state == ConnectionState::Failed ? ConnectionReceive::Failed : ConnectionReceive::Discarded;
   if ( datagram.peer != self.peer )
     return ConnectionReceive::Discarded;
@@ -570,6 +667,12 @@ ConnectionReceive HandshakeConnection::receive( const UdpDatagram& datagram )
   if ( self.config.tls.server && datagram.payload.size() < 1200 && first->kind == PacketKind::Initial )
     return ConnectionReceive::Discarded;
   self.budget.record_received( datagram.payload.size() );
+  self.attributed_received = add_time( self.attributed_received, datagram.payload.size() );
+  if ( self.state == ConnectionState::Closing ) {
+    if ( self.last_clock >= self.close_response_after )
+      self.close_pending = true;
+    return ConnectionReceive::Discarded;
+  }
   self.amplification_blocked = false;
   self.pacing_wakeup.reset();
   bool processed = false;
@@ -609,20 +712,24 @@ std::optional<UdpDatagram> HandshakeConnection::poll_transmit()
 std::optional<uint64_t> HandshakeConnection::next_timeout_us() const
 {
   const auto& self = *impl_;
+  if ( self.end_deadline )
+    return self.end_deadline;
+  auto result = self.idle_deadline();
   if ( terminal( self.state ) || !self.tls || self.amplification_blocked )
-    return std::nullopt;
-  const auto loss = self.recovery.deadline( self.recovery_context() );
-  if ( loss && self.pacing_wakeup )
-    return std::min( *loss, *self.pacing_wakeup );
-  return loss ? loss : self.pacing_wakeup;
+    return result;
+  for ( const auto deadline : { self.recovery.deadline( self.recovery_context() ), self.pacing_wakeup } ) {
+    if ( deadline )
+      result = result ? std::min( *result, *deadline ) : deadline;
+  }
+  return result;
 }
 void HandshakeConnection::on_timeout()
 {
   auto& self = *impl_;
-  if ( terminal( self.state ) || !self.tls || self.amplification_blocked )
-    return;
   try {
     const auto now = self.now_us();
+    if ( self.expire( now ) || terminal( self.state ) || !self.tls || self.amplification_blocked )
+      return;
     if ( self.pacing_wakeup && *self.pacing_wakeup <= now )
       self.pacing_wakeup.reset();
     const auto events = self.recovery.timeout( now, self.recovery_context() );
@@ -644,6 +751,34 @@ CongestionStats HandshakeConnection::congestion_stats() const
 size_t HandshakeConnection::packets_awaiting_ack( PacketKind kind ) const
 {
   return impl_->acks.outstanding( kind );
+}
+bool HandshakeConnection::close( uint64_t application_error, std::string_view reason )
+{
+  auto& self = *impl_;
+  try {
+    if ( self.expire( self.now_us() )
+         || ( self.state != ConnectionState::Established && self.state != ConnectionState::Confirmed )
+         || application_error > max_varint || reason.size() > 256 )
+      return false;
+    const auto secret = self.tls->secret( PacketKind::OneRtt, true );
+    const auto number = self.numbers.allocate( PacketKind::OneRtt );
+    if ( !secret || !number ) {
+      self.stop( ConnectionState::Failed, 0x01 );
+      return false;
+    }
+    self.closing_info = ConnectionCloseFrame { true, application_error, std::nullopt, std::string { reason } };
+    auto keys = derive_packet_keys( *secret );
+    self.close_wire = seal_one_rtt_packet( keys, *self.peer_id, *number, 4, encode_frame( *self.closing_info ) );
+    OPENSSL_cleanse( &keys, sizeof( keys ) );
+    self.close_interval = self.base_pto_us();
+    self.close_response_after = add_time( self.last_clock, self.close_interval );
+    self.close_pending = true;
+    self.stop( ConnectionState::Closing );
+    return true;
+  } catch ( ... ) {
+    self.stop( ConnectionState::Failed, 0x01 );
+    return false;
+  }
 }
 bool HandshakeConnection::send_ping()
 {
@@ -683,6 +818,10 @@ size_t HandshakeConnection::stream_send_buffered() const
 ConnectionState HandshakeConnection::state() const
 {
   return impl_->state;
+}
+std::optional<ConnectionCloseFrame> HandshakeConnection::close_info() const
+{
+  return impl_->closing_info;
 }
 std::optional<uint64_t> HandshakeConnection::transport_error() const
 {
