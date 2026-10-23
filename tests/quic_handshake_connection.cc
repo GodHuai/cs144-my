@@ -466,12 +466,13 @@ void errors_and_close()
       require( result == ConnectionReceive::Processed && server.state() == ConnectionState::Draining,
                "peer close was not terminal before TLS dispatch" );
     } else {
-      require( result == ConnectionReceive::Failed && server.state() == ConnectionState::Failed,
+      require( result == ConnectionReceive::Failed && server.state() == ConnectionState::Closing,
                "invalid authenticated packet did not fail" );
       require( server.transport_error() == ( mode == 0 ? 0x07 : 0x0a ), "wrong error or non-atomic preflight" );
     }
     const auto error = server.transport_error();
-    require( !server.poll_transmit() && !server.send_ping() && !server.peer_parameters(),
+    require( server.poll_transmit().has_value() == ( mode != 3 ) && !server.poll_transmit() && !server.send_ping()
+               && !server.peer_parameters(),
              "terminal output/state leaked" );
     server.receive( { client_address, initial_packet( "x", 2 ), 0 } );
     require( server.transport_error() == error, "terminal error changed" );
@@ -577,13 +578,30 @@ void external_server_context( size_t mode )
     require( client.state() == ConnectionState::Established, "external server flight did not establish" );
     const auto secret = server.secret( PacketKind::OneRtt, true );
     require( secret.has_value(), "external server application secret missing" );
+    if ( mode == 3 ) {
+      const auto done = seal_one_rtt_packet(
+        derive_packet_keys( *secret ), "clientid", 0, 4, encode_frame( HandshakeDoneFrame {} ) );
+      require( client.receive( { server_address, done, 0 } ) == ConnectionReceive::Processed
+                 && client.state() == ConnectionState::Confirmed,
+               "confirmed error setup" );
+    }
     const auto payload = mode == 1 ? encode_frame( PingFrame {} ) : encode_frame( CryptoFrame { 0, "ticket" } );
-    const auto wire = seal_one_rtt_packet( derive_packet_keys( *secret ), "clientid", 0, 4, payload, mode == 1 );
+    const auto wire
+      = seal_one_rtt_packet( derive_packet_keys( *secret ), "clientid", mode == 3 ? 1 : 0, 4, payload, mode == 1 );
     client.receive( { server_address, wire, 0 } );
   }
-  require( client.state() == ConnectionState::Failed && client.transport_error() == ( mode == 0 ? 0x08 : 0x01 ),
+  require( client.state() == ConnectionState::Closing && client.transport_error() == ( mode == 0 ? 0x08 : 0x01 ),
            "CID mismatch or unsupported application crypto was silently accepted" );
-  require( !client.poll_transmit() && !client.peer_parameters(), "failed CID validation exposed state" );
+  const auto close = client.poll_transmit();
+  require( close.has_value() && !client.poll_transmit() && !client.peer_parameters(),
+           "failed CID validation exposed state" );
+  if ( mode == 3 ) {
+    const auto layout = parse_protected_packet( close->payload, 0, 8 );
+    const auto info = client.close_info();
+    require( layout && layout->kind == PacketKind::OneRtt && layout->packet_end == close->payload.size() && info
+               && !info->application && info->frame_type == 6,
+             "confirmed error used retired level or wrong frame" );
+  }
 }
 
 void authenticated_initial_error()
@@ -607,6 +625,15 @@ void authenticated_initial_error()
   require( server.receive( { client_address, wire, 0 } ) == ConnectionReceive::Failed
              && server.transport_error() == 0x0a,
            "authenticated Initial reserved bits silently discarded" );
+  const auto response = server.poll_transmit();
+  require( response.has_value() && !server.poll_transmit(), "reserved-bit close missing" );
+  const auto opened = open_initial_packet( keys.server, InitialSender::Server, response->payload, 0, std::nullopt );
+  require( opened && opened->layout.dcid == "clientid" && opened->layout.scid == "serverid",
+           "reserved close route/key" );
+  const auto frames = decode_frames( opened->plaintext );
+  require( frames && std::holds_alternative<ConnectionCloseFrame>( frames->front() ),
+           "reserved close frame missing" );
+  require( std::get<ConnectionCloseFrame>( frames->front() ).error_code == 0x0a, "reserved close wrong code" );
   require( server.receive( { client_address, initial_packet( "x", 1 ), 0 } ) == ConnectionReceive::Failed
              && server.transport_error() == 0x0a && !server.poll_transmit(),
            "reserved-bit error not sticky" );
@@ -703,7 +730,7 @@ int main()
     discarded_inputs();
     errors_and_close();
     amplification_pause();
-    for ( size_t mode = 0; mode < 3; ++mode )
+    for ( size_t mode = 0; mode < 4; ++mode )
       external_server_context( mode );
     invalid_config();
     udp( "127.0.0.1" );

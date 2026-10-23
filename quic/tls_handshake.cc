@@ -37,6 +37,7 @@ struct TlsHandshake::Impl
 {
   TlsConfig config;
   CryptoStreams streams;
+  WriteSecretObserver write_secret_observer;
   std::string local_parameters {};
   std::string input_record {};
   bool record_held { false };
@@ -152,6 +153,8 @@ struct TlsHandshake::Impl
       auto& key = self.keys[*key_index( kind, direction == 1 )];
       key.emplace();
       std::copy_n( bytes, length, key->begin() );
+      if ( direction == 1 && self.write_secret_observer )
+        self.write_secret_observer( kind, *key );
       ( direction == 1 ? self.write_level : self.read_level ) = kind;
       return 1;
     } );
@@ -212,8 +215,10 @@ struct TlsHandshake::Impl
     return SSL_TLSEXT_ERR_ALERT_FATAL;
   }
 
-  Impl( TlsConfig cfg, size_t receive_capacity, size_t send_capacity )
-    : config( std::move( cfg ) ), streams( receive_capacity, send_capacity )
+  Impl( TlsConfig cfg, size_t receive_capacity, size_t send_capacity, WriteSecretObserver observer )
+    : config( std::move( cfg ) )
+    , streams( receive_capacity, send_capacity )
+    , write_secret_observer( std::move( observer ) )
   {
     const auto own_cid = config.local_parameters.find( 0x0f );
     const auto original = config.local_parameters.find( 0x00 );
@@ -300,8 +305,11 @@ struct TlsHandshake::Impl
   }
 };
 
-TlsHandshake::TlsHandshake( TlsConfig config, size_t receive_capacity, size_t send_capacity )
-  : impl_( std::make_unique<Impl>( std::move( config ), receive_capacity, send_capacity ) )
+TlsHandshake::TlsHandshake( TlsConfig config,
+                            size_t receive_capacity,
+                            size_t send_capacity,
+                            WriteSecretObserver observer )
+  : impl_( std::make_unique<Impl>( std::move( config ), receive_capacity, send_capacity, std::move( observer ) ) )
 {}
 TlsHandshake::~TlsHandshake() = default;
 

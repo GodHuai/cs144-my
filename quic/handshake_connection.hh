@@ -48,6 +48,7 @@ public:
   ~HandshakeConnection();
   HandshakeConnection( const HandshakeConnection& ) = delete;
   HandshakeConnection& operator=( const HandshakeConnection& ) = delete;
+  // Authenticated errors report Failed while state() enters Closing if a close can be sealed.
   ConnectionReceive receive( const UdpDatagram& datagram );
   // Handoff reserves amplification bytes and advances send cursors. If UDP
   // would block, retain/retry THIS datagram, without polling for its replacement.

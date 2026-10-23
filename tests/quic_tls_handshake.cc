@@ -138,6 +138,20 @@ void terminal( TlsHandshake& failed )
   require( failed.negotiated_alpn().empty() && !failed.peer_parameters(), "failed TLS exposes negotiated state" );
 }
 
+void write_observer_exception()
+{
+  bool observed = false;
+  TlsHandshake client { config( false ) };
+  TlsHandshake server { config( true ), 65536, 65536, [&]( PacketKind kind, const std::array<uint8_t, 32>& ) {
+                         require( kind == PacketKind::Handshake, "observer reported unexpected level" );
+                         observed = true;
+                         throw std::runtime_error( "observer failure" );
+                       } };
+  run( client, server );
+  require( observed, "write observer not invoked" );
+  terminal( server );
+  require( server.transport_error() == 1, "observer exception not contained" );
+}
 void failures()
 {
   for ( size_t mode = 0; mode < 4; ++mode ) {
@@ -285,6 +299,7 @@ int main()
   try {
     success();
     connection_context();
+    write_observer_exception();
     failures();
     configuration();
     level_boundaries();

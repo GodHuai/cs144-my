@@ -57,6 +57,56 @@ std::string initial_packet( std::string plaintext, uint64_t pn = 0, std::string_
   const auto keys = derive_initial_keys( dcid );
   return seal_initial_packet( keys->client, InitialSender::Client, dcid, "clientid", "", pn, 4, plaintext );
 }
+void initial_protocol_close()
+{
+  uint64_t now = 1000;
+  for ( int variant = 0; variant < 6; ++variant ) {
+    const auto mode = variant % 3;
+    auto cfg = config( true );
+    if ( variant >= 3 )
+      cfg.local_cid.assign( 20, char( 115 ) );
+    cfg.clock_us = [&] { return now; };
+    HandshakeConnection server { cfg, client_address };
+    const auto plaintext = mode == 0   ? std::string( 1, char( 0x1f ) )
+                           : mode == 1 ? encode_frame( AckFrame { 0, { { 0, 0 } }, std::nullopt } )
+                                       : encode_frame( HandshakeDoneFrame {} );
+    const auto wire = initial_packet( plaintext );
+    auto damaged = wire;
+    damaged.back() ^= 1;
+    require( server.receive( { client_address, damaged, 0 } ) == ConnectionReceive::Discarded
+               && !server.poll_transmit() && server.state() == ConnectionState::WaitingInitial,
+             "forged Initial caused close" );
+    require( server.receive( { client_address, wire, 0 } ) == ConnectionReceive::Failed,
+             "protocol error receive status" );
+    const auto response = server.poll_transmit();
+    require( response.has_value(), "authenticated Initial error produced no close" );
+    require( server.state() == ConnectionState::Closing && response->payload.size() == 1200,
+             "Initial close state or size" );
+    const auto keys = *derive_initial_keys( "original" );
+    const auto opened
+      = open_initial_packet( keys.server, InitialSender::Server, response->payload, 0, std::nullopt );
+    require( opened && opened->layout.dcid == "clientid" && opened->layout.scid == cfg.local_cid,
+             "Initial close wrong keys or route" );
+    const auto frames = decode_frames( opened->plaintext );
+    require( frames && std::holds_alternative<ConnectionCloseFrame>( frames->front() ),
+             "Initial close missing frame" );
+    const auto& close = std::get<ConnectionCloseFrame>( frames->front() );
+    require( !close.application && close.error_code == ( mode == 0 ? 7 : 10 )
+               && close.frame_type
+                    == ( mode == 0   ? 0
+                         : mode == 1 ? 2
+                                     : 0x1e ),
+             "Initial close wrong diagnostic" );
+    const auto due = server.next_timeout_us();
+    require( due && !server.poll_transmit(), "Initial close lifecycle missing" );
+    server.receive( { client_address, initial_packet( "x", 1 ), 0 } );
+    require( server.transport_error() == close.error_code && server.next_timeout_us() == due,
+             "error close not sticky" );
+    now = *due;
+    server.on_timeout();
+    require( server.state() == ConnectionState::Closed && !server.poll_transmit(), "error close not reclaimed" );
+  }
+}
 void peer_close_timer()
 {
   uint64_t now = 1000;
@@ -129,6 +179,10 @@ void local_close()
   require( due.has_value(), "closing expiry missing" );
   const auto close = p.c.poll_transmit();
   require( close.has_value() && !p.c.poll_transmit(), "close initial output" );
+  const auto close_layout = parse_protected_packet( close->payload, 0, 8 );
+  require( close_layout && close_layout->kind == PacketKind::OneRtt
+             && close_layout->packet_end == close->payload.size(),
+           "confirmed app close used retired keys" );
   require( p.c.congestion_stats().bytes_in_flight == 0 && !p.c.peer_parameters() && p.c.stream_send_buffered() == 0
              && p.c.stream_ids().empty(),
            "closing state retained payload/keys" );
@@ -171,6 +225,104 @@ void local_close()
   require( !early.close(), "early application close" );
 }
 
+std::vector<PacketLayout> layouts( const UdpDatagram& datagram )
+{
+  std::vector<PacketLayout> out;
+  size_t offset = 0;
+  while ( offset < datagram.payload.size() ) {
+    const auto layout = parse_protected_packet( datagram.payload, offset, 8 );
+    require( layout.has_value(), "close coalescing malformed" );
+    out.push_back( *layout );
+    offset = layout->packet_end;
+  }
+  return out;
+}
+std::optional<UdpDatagram> handshake_part( const UdpDatagram& d )
+{
+  size_t offset = 0;
+  for ( const auto& layout : layouts( d ) ) {
+    if ( layout.kind == PacketKind::Handshake )
+      return UdpDatagram { d.peer, d.payload.substr( offset, layout.packet_end - offset ), 0 };
+    offset = layout.packet_end;
+  }
+  return std::nullopt;
+}
+void early_application_close()
+{
+  uint64_t now = 1000;
+  auto cc = config( false ), sc = config( true );
+  cc.clock_us = sc.clock_us = [&] { return now; };
+  HandshakeConnection c { cc, server_address }, s { sc, client_address };
+  transfer( c, s, client_address );
+  transfer( s, c, server_address );
+  require( c.state() == ConnectionState::Established && s.state() == ConnectionState::Handshaking,
+           "early close setup" );
+  require( c.close( 0x77, "private reason" ), "early close rejected" );
+  const auto close = c.poll_transmit();
+  require( close.has_value(), "early close absent" );
+  const auto fallback = handshake_part( *close );
+  require( fallback.has_value(), "early close omitted Handshake fallback" );
+  // Drop the other levels: server can decrypt Handshake even without client Finished.
+  deliver( s, *fallback, client_address );
+  const auto remote = s.close_info();
+  require( s.state() == ConnectionState::Draining && remote && !remote->application && remote->error_code == 0x0c
+             && remote->frame_type == 0 && remote->reason.empty(),
+           "lower level leaked app diagnostic" );
+  const auto local = c.close_info();
+  require( local && local->application && local->error_code == 0x77 && local->reason == "private reason",
+           "fallback overwrote local diagnostic" );
+  const auto parts = layouts( *close );
+  require( parts.back().kind == PacketKind::OneRtt && close->payload.size() == 1200,
+           "early close order/Initial padding" );
+}
+void server_before_serverhello_error()
+{
+  uint64_t now = 1000;
+  auto cc = config( false ), sc = config( true );
+  cc.clock_us = sc.clock_us = [&] { return now; };
+  HandshakeConnection c { cc, server_address }, s { sc, client_address };
+  transfer( c, s, client_address );
+  require( s.receive( { client_address, initial_packet( std::string( 1, char( 0x1f ) ), 100 ), 0 } )
+             == ConnectionReceive::Failed,
+           "server early error" );
+  const auto close = s.poll_transmit();
+  require( close.has_value(), "server early close absent" );
+  const auto parts = layouts( *close );
+  require( parts.front().kind == PacketKind::Initial && handshake_part( *close ) && close->payload.size() == 1200,
+           "server early levels/padding" );
+  // Client never received ServerHello: only Initial can notify it.
+  deliver( c, *close, server_address );
+  const auto info = c.close_info();
+  require( c.state() == ConnectionState::Draining && info && info->error_code == 7,
+           "Initial fallback not usable before ServerHello" );
+}
+void certificate_error_close()
+{
+  uint64_t now = 1000;
+  auto cc = config( false ), sc = config( true );
+  cc.clock_us = sc.clock_us = [&] { return now; };
+  cc.tls.server_name = "wrong.example";
+  HandshakeConnection c { cc, server_address }, s { sc, client_address };
+  transfer( c, s, client_address );
+  bool failed = false;
+  for ( const auto& datagram : drain( s ) ) {
+    if ( deliver( c, datagram, server_address ) == ConnectionReceive::Failed ) {
+      failed = true;
+      break;
+    }
+  }
+  require( failed && c.transport_error() && *c.transport_error() >= 0x100,
+           "certificate rejection did not preserve TLS alert" );
+  const auto close = c.poll_transmit();
+  require( close.has_value(), "TLS error close absent" );
+  const auto fallback = handshake_part( *close );
+  require( fallback.has_value(), "TLS failure lost same-advance Handshake write key" );
+  deliver( s, *fallback, client_address );
+  const auto info = s.close_info();
+  require( s.state() == ConnectionState::Draining && info && info->error_code == c.transport_error()
+             && !info->application,
+           "TLS close decryption or code failed" );
+}
 void idle_under_amplification_block()
 {
   uint64_t now = 1000;
@@ -264,6 +416,10 @@ void idle_activity()
 int main()
 {
   try {
+    certificate_error_close();
+    early_application_close();
+    server_before_serverhello_error();
+    initial_protocol_close();
     peer_close_timer();
     local_close();
     idle_under_amplification_block();

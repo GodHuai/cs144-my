@@ -45,6 +45,29 @@ uint64_t add_time( uint64_t base, uint64_t interval )
 {
   return base + std::min( interval, std::numeric_limits<uint64_t>::max() - base );
 }
+struct WriteSecrets
+{
+  std::array<std::optional<std::array<uint8_t, 32>>, 2> keys {};
+  void clear( size_t slot ) noexcept
+  {
+    if ( keys[slot] ) {
+      OPENSSL_cleanse( keys[slot]->data(), keys[slot]->size() );
+      keys[slot].reset();
+    }
+  }
+  void clear() noexcept
+  {
+    clear( 0 );
+    clear( 1 );
+  }
+  ~WriteSecrets() { clear(); }
+};
+struct PacketKeysGuard
+{
+  PacketProtectionKeys value;
+  ~PacketKeysGuard() { OPENSSL_cleanse( &value, sizeof( value ) ); }
+};
+
 }
 struct HandshakeConnection::Impl
 {
@@ -53,6 +76,7 @@ struct HandshakeConnection::Impl
   ConnectionState state;
   std::optional<uint64_t> error {};
   std::optional<ConnectionCloseFrame> closing_info {};
+  std::optional<PacketLayout> authenticated_route {};
   std::optional<uint64_t> end_deadline {};
   std::string close_wire {};
   uint64_t attributed_received {}, close_sent {}, close_response_after {}, close_interval {};
@@ -63,6 +87,7 @@ struct HandshakeConnection::Impl
   std::optional<std::string> peer_id {};
   std::string original {};
   std::optional<InitialKeys> initial {};
+  WriteSecrets write_secrets {}; // Outlives TLS, including constructor unwind.
   std::unique_ptr<TlsHandshake> tls {};
   PacketNumberSpaces numbers {};
   AntiAmplificationBudget budget;
@@ -178,6 +203,7 @@ struct HandshakeConnection::Impl
     if ( handshake_retired )
       return;
     handshake_retired = true;
+    write_secrets.clear( 0 );
     acks.discard( PacketKind::Handshake );
     recovery.discard( PacketKind::Handshake );
     tls->discard_keys( PacketKind::Handshake );
@@ -193,6 +219,7 @@ struct HandshakeConnection::Impl
     pacing_wakeup.reset();
     clear_initial();
     tls.reset();
+    write_secrets.clear();
     streams.reset();
     pending.clear();
     pending_bytes = 0;
@@ -202,10 +229,99 @@ struct HandshakeConnection::Impl
     acks.discard( PacketKind::OneRtt );
     recovery.discard( PacketKind::OneRtt );
   }
+  std::unique_ptr<TlsHandshake> make_tls()
+  {
+    return std::make_unique<TlsHandshake>(
+      config.tls, 65536, 65536, [this]( PacketKind kind, const std::array<uint8_t, 32>& secret ) {
+        if ( kind == PacketKind::Handshake && handshake_retired )
+          return;
+        const size_t slot = kind == PacketKind::Handshake ? 0 : 1;
+        write_secrets.clear( slot );
+        write_secrets.keys[slot] = secret;
+      } );
+  }
+  bool begin_close( ConnectionCloseFrame frame, std::optional<uint64_t> code = std::nullopt )
+  {
+    const bool confirmed = state == ConnectionState::Confirmed;
+    const bool use_initial = !confirmed && !initial_retired && initial;
+    const bool use_handshake = !confirmed && !handshake_retired && write_secrets.keys[0];
+    const bool use_application = write_secrets.keys[1].has_value();
+    if ( !use_initial && !use_handshake && !use_application )
+      return false;
+    std::string suffix;
+    const auto destination = peer_id.value_or( original );
+    auto lower = frame;
+    if ( lower.application )
+      lower = ConnectionCloseFrame { false, 0x0c, 0, "" };
+    for ( const auto kind : { PacketKind::Handshake, PacketKind::OneRtt } ) {
+      if ( kind == PacketKind::Handshake ? !use_handshake : !use_application )
+        continue;
+      const auto number = numbers.allocate( kind );
+      if ( !number )
+        return false; // Exhaustion forbids ALL further packets, even lower levels.
+      PacketKeysGuard keys { derive_packet_keys( *write_secrets.keys[kind == PacketKind::Handshake ? 0 : 1] ) };
+      const auto payload = encode_frame( kind == PacketKind::Handshake ? lower : frame );
+      suffix += kind == PacketKind::Handshake
+                  ? seal_handshake_packet( keys.value, destination, config.local_cid, *number, 4, payload )
+                  : seal_one_rtt_packet( keys.value, destination, *number, 4, payload );
+    }
+    std::string wire;
+    if ( use_initial ) {
+      const auto number = numbers.allocate( PacketKind::Initial );
+      if ( !number )
+        return false;
+      const auto initial_bytes = 1200 - suffix.size();
+      auto payload = encode_frame( lower );
+      const auto header = build_long_header(
+        LongPacketType::Initial, destination, config.local_cid, "", *number, 4, initial_bytes );
+      if ( initial_bytes < header.size() + 16 + payload.size() )
+        return false;
+      payload.resize( initial_bytes - header.size() - 16, char( 0 ) );
+      wire = seal_initial_packet( config.tls.server ? initial->server : initial->client,
+                                  config.tls.server ? InitialSender::Server : InitialSender::Client,
+                                  destination,
+                                  config.local_cid,
+                                  "",
+                                  *number,
+                                  4,
+                                  payload );
+    }
+    wire += suffix;
+    if ( wire.empty() || wire.size() > 1200 || ( use_initial && wire.size() != 1200 ) )
+      throw std::logic_error( "QUIC close packet size mismatch" );
+    closing_info = std::move( frame );
+    close_wire = std::move( wire );
+    close_interval = base_pto_us();
+    close_response_after = add_time( last_clock, close_interval );
+    close_pending = true;
+    stop( ConnectionState::Closing, code );
+    return true;
+  }
+  void fail( uint64_t code, uint64_t frame_type = 0 )
+  {
+    if ( terminal( state ) )
+      return;
+    try {
+      if ( !peer_id && authenticated_route && authenticated_route->kind == PacketKind::Initial ) {
+        peer_id = authenticated_route->scid;
+        if ( config.tls.server ) {
+          original = authenticated_route->dcid;
+          initial = derive_initial_keys( original );
+        }
+      }
+      if ( begin_close( ConnectionCloseFrame { false, code, frame_type, "" }, code ) )
+        return;
+    } catch ( ... ) {
+      // Local inability to seal must never recurse through protocol close.
+    }
+    close_wire.clear();
+    close_pending = false;
+    stop( ConnectionState::Failed, code );
+  }
   void advance()
   {
     if ( tls->advance() == TlsProgress::Failed ) {
-      stop( ConnectionState::Failed, tls->transport_error().value_or( 0x01 ) );
+      fail( tls->transport_error().value_or( 0x01 ), 0x06 );
     } else if ( tls->complete() && state == ConnectionState::Handshaking ) {
       state = config.tls.server ? ConnectionState::Confirmed : ConnectionState::Established;
       if ( config.tls.server ) {
@@ -238,7 +354,7 @@ struct HandshakeConnection::Impl
       config.tls.original_destination_connection_id = original;
       config.tls.peer_initial_source_connection_id.clear();
       config.tls.defer_peer_initial_source_connection_id = true;
-      tls = std::make_unique<TlsHandshake>( config.tls );
+      tls = make_tls();
       advance();
     }
   }
@@ -263,23 +379,27 @@ struct HandshakeConnection::Impl
   // Validate every frame before dispatching any CRYPTO, close or confirmation.
   bool preflight( const std::vector<Frame>& frames, PacketKind kind )
   {
-    if ( frames.empty() || !frames_allowed_in_packet( frames, kind ) ) {
-      stop( ConnectionState::Failed, 0x0a );
+    if ( frames.empty() ) {
+      fail( 0x0a );
       return false;
     }
     for ( const auto& frame : frames ) {
+      if ( !frame_allowed_in_packet( frame, kind ) ) {
+        fail( 0x0a, static_cast<uint8_t>( encode_frame( frame ).front() ) );
+        return false;
+      }
       if ( kind == PacketKind::OneRtt && std::holds_alternative<CryptoFrame>( frame ) ) {
-        stop( ConnectionState::Failed, 0x01 ); // Post-handshake TLS is not implemented yet.
+        fail( 0x01, 0x06 ); // Post-handshake TLS is not implemented yet.
         return false;
       }
       if ( std::holds_alternative<HandshakeDoneFrame>( frame )
            && ( config.tls.server || !tls || !tls->complete() ) ) {
-        stop( ConnectionState::Failed, 0x0a );
+        fail( 0x0a, 0x1e );
         return false;
       }
       if ( const auto* ack = std::get_if<AckFrame>( &frame ) ) {
         if ( !acks.valid_ack( kind, *ack ) ) {
-          stop( ConnectionState::Failed, 0x0a );
+          fail( 0x0a, std::holds_alternative<AckFrame>( frame ) && std::get<AckFrame>( frame ).ecn ? 3 : 2 );
           return false;
         }
       } else if ( !std::holds_alternative<PaddingFrame>( frame ) && !std::holds_alternative<PingFrame>( frame )
@@ -287,13 +407,15 @@ struct HandshakeConnection::Impl
                   && !std::holds_alternative<HandshakeDoneFrame>( frame )
                   && !std::holds_alternative<ConnectionCloseFrame>( frame )
                   && !( kind == PacketKind::OneRtt && streams && ApplicationStreams::handles( frame ) ) ) {
-        stop( ConnectionState::Failed, 0x01 ); // Unsupported local feature, not a peer violation.
+        fail( 0x01,
+              static_cast<uint8_t>(
+                encode_frame( frame ).front() ) ); // Unsupported local feature, not a peer violation.
         return false;
       }
     }
     if ( streams && kind == PacketKind::OneRtt ) {
       if ( auto code = streams->receive( frames ) ) {
-        stop( ConnectionState::Failed, *code );
+        fail( *code );
         return false;
       }
     }
@@ -323,7 +445,8 @@ struct HandshakeConnection::Impl
                                         0,
                                         largest );
       if ( opened.transport_error ) {
-        stop( ConnectionState::Failed, opened.transport_error );
+        authenticated_route = *layout;
+        fail( *opened.transport_error );
         return ConnectionReceive::Failed;
       }
       if ( !opened.packet )
@@ -342,18 +465,21 @@ struct HandshakeConnection::Impl
                             ? open_handshake_packet( keys, wire, 0, largest )
                             : open_one_rtt_packet( keys, wire, 0, config.local_cid.size(), largest );
       if ( opened.transport_error ) {
-        stop( ConnectionState::Failed, opened.transport_error );
+        authenticated_route = *layout;
+        fail( *opened.transport_error );
         return ConnectionReceive::Failed;
       }
       if ( !opened.packet )
         return ConnectionReceive::Discarded;
       if ( opened.packet->key_phase ) {
-        stop( ConnectionState::Failed, 0x01 ); // Key updates require the future recovery/key lifecycle layer.
+        fail( 0x01 ); // Key updates require the future recovery/key lifecycle layer.
         return ConnectionReceive::Failed;
       }
       number = opened.packet->packet_number;
       plaintext = opened.packet->plaintext;
     }
+    if ( !peer_id && kind == PacketKind::Initial )
+      authenticated_route = *layout;
     // Duplicate detection precedes semantic dispatch (including late TLS data).
     const bool fresh = numbers.record_authenticated( kind, number );
     const auto new_largest = *numbers.largest_received( kind );
@@ -370,7 +496,7 @@ struct HandshakeConnection::Impl
       return ConnectionReceive::Discarded;
     }
     if ( !frames ) {
-      stop( ConnectionState::Failed, 0x07 );
+      fail( 0x07 );
       return ConnectionReceive::Failed;
     }
     if ( !preflight( *frames, kind ) )
@@ -396,10 +522,10 @@ struct HandshakeConnection::Impl
         config.tls.local_parameters[0x00] = original;
         config.tls.peer_initial_source_connection_id = *peer_id;
         config.tls.defer_peer_initial_source_connection_id = false;
-        tls = std::make_unique<TlsHandshake>( config.tls );
+        tls = make_tls();
         state = ConnectionState::Handshaking;
       } else if ( !tls->bind_peer_initial_source_connection_id( *peer_id ) ) {
-        stop( ConnectionState::Failed, 0x01 );
+        fail( 0x01 );
         return ConnectionReceive::Failed;
       }
     }
@@ -419,7 +545,7 @@ struct HandshakeConnection::Impl
           } ) );
       } else if ( const auto* crypto = std::get_if<CryptoFrame>( &frame ) ) {
         if ( !tls->receive( kind, *crypto ) ) {
-          stop( ConnectionState::Failed, tls->transport_error().value_or( 0x01 ) );
+          fail( tls->transport_error().value_or( 0x01 ), 0x06 );
           return ConnectionReceive::Failed;
         }
       } else if ( std::holds_alternative<HandshakeDoneFrame>( frame ) ) {
@@ -428,7 +554,7 @@ struct HandshakeConnection::Impl
       }
     }
     advance();
-    return state == ConnectionState::Failed ? ConnectionReceive::Failed : ConnectionReceive::Processed;
+    return error ? ConnectionReceive::Failed : ConnectionReceive::Processed;
   }
   void replay()
   {
@@ -671,7 +797,7 @@ ConnectionReceive HandshakeConnection::receive( const UdpDatagram& datagram )
   if ( self.state == ConnectionState::Closing ) {
     if ( self.last_clock >= self.close_response_after )
       self.close_pending = true;
-    return ConnectionReceive::Discarded;
+    return self.error ? ConnectionReceive::Failed : ConnectionReceive::Discarded;
   }
   self.amplification_blocked = false;
   self.pacing_wakeup.reset();
@@ -696,7 +822,7 @@ ConnectionReceive HandshakeConnection::receive( const UdpDatagram& datagram )
   } catch ( ... ) {
     self.stop( ConnectionState::Failed, 0x01 );
   }
-  if ( self.state == ConnectionState::Failed )
+  if ( self.state == ConnectionState::Failed || ( self.state == ConnectionState::Closing && self.error ) )
     return ConnectionReceive::Failed;
   return processed ? ConnectionReceive::Processed : ConnectionReceive::Discarded;
 }
@@ -760,21 +886,11 @@ bool HandshakeConnection::close( uint64_t application_error, std::string_view re
          || ( self.state != ConnectionState::Established && self.state != ConnectionState::Confirmed )
          || application_error > max_varint || reason.size() > 256 )
       return false;
-    const auto secret = self.tls->secret( PacketKind::OneRtt, true );
-    const auto number = self.numbers.allocate( PacketKind::OneRtt );
-    if ( !secret || !number ) {
-      self.stop( ConnectionState::Failed, 0x01 );
-      return false;
-    }
-    self.closing_info = ConnectionCloseFrame { true, application_error, std::nullopt, std::string { reason } };
-    auto keys = derive_packet_keys( *secret );
-    self.close_wire = seal_one_rtt_packet( keys, *self.peer_id, *number, 4, encode_frame( *self.closing_info ) );
-    OPENSSL_cleanse( &keys, sizeof( keys ) );
-    self.close_interval = self.base_pto_us();
-    self.close_response_after = add_time( self.last_clock, self.close_interval );
-    self.close_pending = true;
-    self.stop( ConnectionState::Closing );
-    return true;
+    if ( self.begin_close(
+           ConnectionCloseFrame { true, application_error, std::nullopt, std::string { reason } } ) )
+      return true;
+    self.stop( ConnectionState::Failed, 0x01 );
+    return false;
   } catch ( ... ) {
     self.stop( ConnectionState::Failed, 0x01 );
     return false;

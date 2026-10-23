@@ -4,6 +4,7 @@
 #include "transport_parameters.hh"
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -41,7 +42,13 @@ enum class TlsProgress
 class TlsHandshake
 {
 public:
-  explicit TlsHandshake( TlsConfig config, size_t receive_capacity = 65536, size_t send_capacity = 65536 );
+  using WriteSecretObserver = std::function<void( PacketKind, const std::array<uint8_t, 32>& )>;
+  // Transport hook: called synchronously before write-secret retirement on error.
+  // Must not reenter TLS. Receiver owns/cleanses any copies; exceptions fail TLS closed.
+  explicit TlsHandshake( TlsConfig config,
+                         size_t receive_capacity = 65536,
+                         size_t send_capacity = 65536,
+                         WriteSecretObserver write_secret_observer = {} );
   ~TlsHandshake();
   TlsHandshake( const TlsHandshake& ) = delete;
   TlsHandshake& operator=( const TlsHandshake& ) = delete;

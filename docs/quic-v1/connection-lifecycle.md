@@ -18,7 +18,7 @@ stateDiagram-v2
   Confirmed --> Closed: idle 到期
 ```
 
-握手中也能收到传输关闭并进入 Draining；上图只画常用路径。原有 Failed 仍表示本地静默终止，首个传输错误可由 `transport_error()` 查询；它不是 Closing 的别名。
+握手中也能收到传输关闭并进入 Draining；上图只画常用路径。Failed 表示无法封包等本地静默终止；认证协议/TLS 错误现已转为 Closing，接收结果仍报告 Failed（见 error-close.md），首个传输错误可由 `transport_error()` 查询；它不是 Closing 的别名。
 
 本地 close 先分配一个新的应用包号、封装 1-RTT CONNECTION_CLOSE，再立即释放 TLS、流、待密文、ACK/恢复记录和物理在途记账。Closing 只保留路由信息、已经加密的关闭包、诊断与期限。流操作不再接受，排队 PING/STREAM 不再输出。
 
@@ -45,8 +45,10 @@ stateDiagram-v2
 
 `quic_connection_lifecycle` 使用真实 TLS 和受保护包、确定性时钟验证：对端 Initial 关闭、主动 1-RTT 关闭及首包丢失、首次回复前拒绝/后续间隔翻倍、定时器不主动重发、错误源/CID、流与在途清理、Draining 静默及边界到期；另覆盖双方/单方非零空闲协商、禁用默认、三倍 PTO 下限、首次实际发送刷新、重复发送/ACK-only/伪造与重放不保活、反放大阻塞下到期和整数上限饱和。
 
-独立审查未发现生产代码缺陷；补充了限速与反放大阻塞下的到期测试。独立三倍上限的耗尽分支未通过伪造内部计数覆盖：应用 close 需要握手完成，已有握手接收信用；当前 3 PTO 寿命与 PTO/2PTO 间隔最多交付两份、有 256 字节原因上限的关闭包，先受限速约束。该上限保留用于无接收密钥路径的纵深约束。
+独立审查未发现生产代码缺陷；补充了限速与反放大阻塞下的到期测试。独立三倍上限的耗尽分支未通过伪造内部计数覆盖：该阶段的应用 close 需要握手完成，已有握手接收信用（后续错误关闭含 Initial 时缓存包可达 1200 字节，仍独立检查三倍上限）；当前 3 PTO 寿命与 PTO/2PTO 间隔最多交付两份、有 256 字节原因上限的关闭包，先受限速约束。该上限保留用于无接收密钥路径的纵深约束。
 
-仍缺本地协议/TLS 错误自动生成传输关闭、握手确认前多保护级别关闭、stateless reset、监听器 tombstone/CID 路由和第三方互通。当前主动 close 只生成 1-RTT；在 Established 但尚未 Confirmed 时，对端可能还没有可用的 1-RTT 接收状态，因此不保证此阶段关闭通知可达。调用方还需从外层连接表清理 Closed 对象；引擎不会替调用方释放 C++ 对象或关闭共享 UDP socket。
+本地协议/TLS 错误自动传输关闭及握手确认前多保护级别关闭已在 [error-close.md](error-close.md) 接入。仍缺 stateless reset、监听器 tombstone/CID 路由和第三方互通。调用方还需从外层连接表清理 Closed 对象；引擎不会替调用方释放 C++ 对象或关闭共享 UDP socket。
 
 最终验证：全量 CTest **58/65**（159.82 秒），其中 QUIC **27/27**，包含公共编译夹具，对应 25 个 QUIC 测试程序与其中一个程序的第二入口。新生命周期测试 3.16 秒。仍为五项既有超时 wrapping_integers_roundtrip、wrapping_integers_extra、recv_transmit、recv_reorder_more、send_transmit；net_interface、router 缺少可执行文件，无新增失败。命令：ctest --test-dir build --output-on-failure --timeout 30 -j2。格式、差异空白和 Markdown 本地链接另行检查。
+
+认证协议/TLS 错误关闭、TLS 写密钥缓存及握手多保护级别通知已实现，接口差异与验证见 [error-close.md](error-close.md)。

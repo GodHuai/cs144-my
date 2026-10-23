@@ -24,7 +24,7 @@
 
 客户端在首次交付 Handshake 包时、服务端在认证收到 Handshake 包时丢弃 Initial 密钥和相应 CRYPTO。两端在确认握手时清除 Handshake 读写 secret 与 CRYPTO，保留应用密钥。退役同时清理该空间的 ACK 与恢复状态，且是幂等的，不会因重复事件再次重置 PTO 退避。TLS 新增的 `discard_keys()` 只供达到上述里程碑且 TLS 已释放旧级别输入的连接调用，不允许以此接口丢弃 OneRtt。
 
-合法的对端关闭进入 Draining，停止输出并按 3 PTO 到期；应用主动关闭与空闲计时见 [connection-lifecycle.md](connection-lifecycle.md)。认证帧错误或 TLS 失败进入 Failed，首个错误保持不变，清理 TLS、输出和待解密队列。尚未实现向对端调度错误 CONNECTION_CLOSE。
+合法的对端关闭进入 Draining，停止输出并按 3 PTO 到期；应用主动关闭与空闲计时见 [connection-lifecycle.md](connection-lifecycle.md)。认证帧错误或 TLS 失败会先封装传输关闭并进入 Closing，首个错误保持不变；接收结果仍报告 Failed。清理 TLS/流/恢复后仅保留缓存关闭密文和期限，见 [error-close.md](error-close.md)。本地时钟、包号耗尽或无法封包时仍静默 Failed。
 
 ## 当前支持范围
 
@@ -51,3 +51,5 @@ ctest --test-dir build --output-on-failure --timeout 30 -j2
 后续已接入有界可靠应用流、FIN/RESET/STOP 与流量控制，当前能力、API、资源限制和验证见 [application-streams.md](application-streams.md)。
 
 本轮补上应用主动关闭、Closing/Draining 到期释放及协商 idle 超时，最新接口、范围和验证见 [connection-lifecycle.md](connection-lifecycle.md)。
+
+认证协议/TLS 错误关闭、TLS 写密钥缓存及握手多保护级别通知已实现，接口差异与验证见 [error-close.md](error-close.md)。

@@ -64,3 +64,5 @@
 后续已实现流终态回收、紧凑关闭 ID 区间与可靠 MAX_STREAMS 补额，最新语义和验证见 [stream-retirement.md](stream-retirement.md)。
 
 本轮补上应用主动关闭、Closing/Draining 到期释放及协商 idle 超时，最新接口、范围和验证见 [connection-lifecycle.md](connection-lifecycle.md)。
+
+认证协议/TLS 错误关闭、TLS 写密钥缓存及握手多保护级别通知已实现，接口差异与验证见 [error-close.md](error-close.md)。
