@@ -1,6 +1,6 @@
 # QUIC v1 实现讲解（进行中）
 
-握手恢复基准 `7abc5c7`（2026-10-22），以下包含后续 NewReno 阶段。目前基础编码、包保护、CRYPTO/TLS、双栈 UDP 和单路径 `HandshakeConnection` 已贯通；即时 ACK、发送时间、RTT、阈值丢包和有界握手 PTO 已接入连接；随后加入固定单路径 NewReno 的物理在途字节、窗口及 ACK/PTO 例外。**可靠应用流、流量控制、持续拥塞/ECN 与第三方互通仍未完成。**
+握手恢复基准 `7abc5c7`（2026-10-22），以下包含后续 NewReno 阶段。目前基础编码、包保护、CRYPTO/TLS、双栈 UDP 和单路径 `HandshakeConnection` 已贯通；即时 ACK、发送时间、RTT、阈值丢包和有界握手 PTO 已接入连接；随后加入固定单路径 NewReno 的物理在途字节、窗口及 ACK/PTO 例外。**应用流数量补额/回收、持续拥塞/ECN 与第三方互通仍未完成。**
 
 基础工具按下面的手算顺序阅读。整包与状态机专题依次见 [Initial 保护](initial-packet-protection.md)、[Initial 整包](initial-packet.md)、[CRYPTO](crypto-streams.md)、[TLS](tls-handshake.md)、[Handshake/1-RTT 包](protected-packets.md)、[UDP](udp.md)、[连接引擎](handshake-connection.md)、[ACK](acknowledgments.md)、[丢包恢复](loss-recovery.md)。独立的路径/CID/Retry 原语并不表示对应迁移和协商状态机已经接线。
 
@@ -21,7 +21,7 @@ flowchart LR
   E --> H[确认与关闭状态]
 ```
 
-认证失败静默丢弃，认证重复包不重新交付 CRYPTO，但可重新触发 ACK。当前没有应用 STREAM 处理器。
+认证失败静默丢弃，认证重复包不重新交付 CRYPTO，但可重新触发 ACK。当前已有有界应用 STREAM 处理器，见 [application-streams.md](application-streams.md)。
 
 `packet number`（包号）给每个受保护包一个号码；`stream offset`（流偏移）标记字节在一条流中的位置。它们不是同一种序号。`pn_offset` 是**数据报内的字节位置**，不是包号。`ACK Delay` 是对端发送 ACK 前有意等待的时间，线上字段还需要依据对端参数换算。源码里的 `std::nullopt` 通常表示输入还不足或格式不支持；抛出的异常多用于调用方要求编码一个不合法值。
 
@@ -240,7 +240,7 @@ ack.ranges.push_back( AckRange { range_largest - *length, range_largest } );
 
 ### 新增流停止与额度帧：先读线上的字节
 
-`RESET_STREAM` 是发送方结束自己那一侧的流：`04 25 02 40 40` 依次表示类型 `04`、流 ID 37 (`25`)、应用错误码 2、最终大小 64 (`40 40`)。`STOP_SENDING` 是接收方请求对端停止发送：`05 03 25` 表示流 ID 3、应用错误码 37。两者看似相近，方向不同；是否允许针对某条流发送、收到后如何处理数据，必须由将来的流状态机判断。[RFC 9000 §19.4](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.4)、[§19.5](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.5)
+`RESET_STREAM` 是发送方结束自己那一侧的流：`04 25 02 40 40` 依次表示类型 `04`、流 ID 37 (`25`)、应用错误码 2、最终大小 64 (`40 40`)。`STOP_SENDING` 是接收方请求对端停止发送：`05 03 25` 表示流 ID 3、应用错误码 37。两者看似相近，方向不同；是否允许针对某条流发送、收到后如何处理数据，现由流状态机判断（见 application-streams.md）。[RFC 9000 §19.4](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.4)、[§19.5](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.5)
 
 额度帧把“可以发送多少”写成**绝对上限**，而阻塞帧报告自己卡在什么上限。`10 40 40` 表示连接最多允许 64 字节；`11 03 25` 表示流 3 最多允许 37 字节。`14 40 40` 和 `15 03 25` 则是发送方分别报告连接级和流级阻塞，不会自动增加额度。实际连接层收到较小的 `MAX_DATA`、`MAX_STREAM_DATA` 时应忽略，不应把额度降回去；这些状态更新不属于当前编解码器。[RFC 9000 §4.1](https://www.rfc-editor.org/rfc/rfc9000.html#section-4.1)、[§19.9–19.13](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.9)
 
@@ -260,7 +260,7 @@ ack.ranges.push_back( AckRange { range_largest - *length, range_largest } );
 
 解析器对 CID、路径数据和重置令牌使用“先确认剩余长度，再读取固定字节数”的做法；对令牌与原因使用显式长度与 `read_data()`。如果完整明文载荷中任何一帧截断，就返回 `std::nullopt`，避免把前面已读出的帧误交给连接层。测试包含合法相邻帧、空令牌、CID 长度 0 或 21、退休阈值倒置、重置令牌缺字节、路径数据缺字节，以及两种关闭帧原因截断。
 
-CRYPTO 和 STREAM 的“偏移 + 数据长度”不能超过 `2^62−1`。代码先比较剩余字节和长度，再复制数据；ACK Range Count 先受载荷剩余长度约束，以免畸形计数导致无意义的长循环。`tests/quic_frames.cc` 检查组合帧往返、无 LEN 的 STREAM、空 FIN、ACK/ACK_ECN、新增控制帧、空载荷、截断、未知类型、区间下溢、畸形大计数与数值边界。流方向、流量控制、ACK 包号空间和 CRYPTO 加密级别等语义规则仍需连接层实现，不能把“能解析”理解为“可以接受”。
+CRYPTO 和 STREAM 的“偏移 + 数据长度”不能超过 `2^62−1`。代码先比较剩余字节和长度，再复制数据；ACK Range Count 先受载荷剩余长度约束，以免畸形计数导致无意义的长循环。`tests/quic_frames.cc` 检查组合帧往返、无 LEN 的 STREAM、空 FIN、ACK/ACK_ECN、新增控制帧、空载荷、截断、未知类型、区间下溢、畸形大计数与数值边界。流方向、流量控制、ACK 包号空间和 CRYPTO 加密级别等语义规则由连接层及独立状态机实现，不能把“能解析”理解为“可以接受”。
 
 ### RFC 9000 §12.4–12.5：一帧能放进哪种包
 
@@ -275,7 +275,7 @@ Frame Type 说明**这是什么帧**；包类型又限制**这里能放什么帧
 
 0-RTT 与 1-RTT 使用**同一个应用数据包号空间**，但不意味着它们能携带同样的帧。特别是 ACK、CRYPTO、HANDSHAKE_DONE、NEW_TOKEN、PATH_RESPONSE、RETIRE_CONNECTION_ID 不能放入 0-RTT；规范允许服务器将收到这些帧视为 PROTOCOL_VIOLATION。Initial/Handshake 中只有 `1c` 传输层关闭帧可以出现，`1d` 应用层关闭帧不行。`ConnectionCloseFrame::application` 决定这一区别；若只看 C++ 结构体名字会漏检。[RFC 9000 §12.5](https://www.rfc-editor.org/rfc/rfc9000.html#section-12.5)
 
-处理流程应是“认证包 → 解出完整明文 → `decode_frames` → 检查每帧所在包类型 → 结合连接状态执行帧”。字节格式失败、包类型不允许、ACK 引用了未发送的包等属于不同检查；目前只有前两项各自具备基础接口，并没有能产生协议错误的完整连接处理器。测试把现有全部 20 种 Frame 变体（并将 CONNECTION_CLOSE 的两种形式分开）对四种包类型逐项比对 RFC 表 3，也检查空载荷和合法帧后面藏有非法帧的情况。读完可以自问：为什么 ACK 与 CRYPTO 都能放 1-RTT，但不能放 0-RTT？答案是同属应用数据包号空间只说明**包号如何编号与确认**，不取消 0-RTT 的帧放置限制。
+处理流程应是“认证包 → 解出完整明文 → `decode_frames` → 检查每帧所在包类型 → 结合连接状态执行帧”。字节格式失败、包类型不允许、ACK 引用了未发送的包等属于不同检查；基础编解码阶段仅提供前两项接口；后续连接已接入认证后完整预检、错误分类及有界应用流处理，但完整 QUIC 状态仍待审计。测试把现有全部 20 种 Frame 变体（并将 CONNECTION_CLOSE 的两种形式分开）对四种包类型逐项比对 RFC 表 3，也检查空载荷和合法帧后面藏有非法帧的情况。读完可以自问：为什么 ACK 与 CRYPTO 都能放 1-RTT，但不能放 0-RTT？答案是同属应用数据包号空间只说明**包号如何编号与确认**，不取消 0-RTT 的帧放置限制。
 
 ## RFC 9001 §5.4：报头保护的掩码操作
 
@@ -337,11 +337,11 @@ PTO（Probe Timeout）是“等待确认过久时，什么时候尝试发探测�
 
 | 规范范围 | 已有的可调用代码 | 必须继续实现的内容 |
 | --- | --- | --- |
-| RFC 9000 | 基础编码、核心帧格式、参数/CID 校验、单路径连接、真实双栈 UDP、即时 ACK、有界发送与接收窗口 | 应用流及流量控制、完整角色/方向语义、VN/Retry 接受、迁移、动态路由、PMTU、关闭/空闲计时 |
+| RFC 9000 | 基础编码、核心帧格式、参数/CID 校验、单路径连接、真实双栈 UDP、即时 ACK、有界发送与接收窗口 | 应用流数量补额/回收、完整角色/方向语义、VN/Retry 接受、迁移、动态路由、PMTU、关闭/空闲计时 |
 | RFC 9001 | Initial/Handshake/1-RTT AES 包保护、CRYPTO、真实 TLS 1.3、证书/ALPN、实际 CID 绑定、握手确认及密钥丢弃 | 其它套件、后握手 TLS、密钥更新/使用上限、会话恢复和 0-RTT |
-| RFC 9002 | 发送时间、ACK 样本筛选、RTT、包号/时间阈值、握手 PTO/退避、迟到 ACK 与共享逻辑帧身份 | 应用流恢复、CRYPTO 发送缓冲按 ACK 回收、持续拥塞、ECN 验证 |
+| RFC 9002 | 发送时间、ACK 样本筛选、RTT、包号/时间阈值、握手 PTO/退避、迟到 ACK 与共享逻辑帧身份 | CRYPTO 发送缓冲按 ACK 回收、持续拥塞、ECN 验证 |
 
-ACK 会对实际已交付包号预检并更新发送历史，物理在途字节及拥塞窗口现由 NewReno 接入。STREAM 仍只具备线上格式编解码，没有应用字节交付和额度约束。完整目标见 `requirements.md`；当前事实以源码、测试和 `coverage.md` 为准。
+ACK 会对实际已交付包号预检并更新发送历史，物理在途字节及拥塞窗口现由 NewReno 接入。STREAM 已接入有界应用字节交付、恢复和额度约束；流数量补额/回收仍待完成。完整目标见 `requirements.md`；当前事实以源码、测试和 `coverage.md` 为准。
 
 ## 验证记录与可复现命令
 
@@ -352,7 +352,7 @@ ACK 会对实际已交付包号预检并更新发送历史，物理在途字节�
 | `varint` | RFC 9000 §16、附录 A.1；长度边界、非最短编码与截断 | 现有实现和测试中的行为与对照规则一致 |
 | `packet_number` / `packet_number_space` | RFC 9000 §12.3、§17.1、附录 A.2/A.3；半窗口、三空间映射、乱序去重与 62 位上限 | 三空间收发和有界去重已实现；连接已接入 ACK 和密钥退役清理 |
 | `packet_header` / `retry_integrity` | RFC 9000 §17.2–17.3、RFC 9001 §5.4、§5.8；v1 包型、CID、Length、样本与 Retry 标签 | 已实现受保护包头布局、VN 线上格式、Retry 字段解析与标签验证原语；客户端接受规则和 Retry 状态机尚未实现 |
-| `frame` | RFC 9000 §12.4–12.5、§19.1–19.20；长度、ACK gap、流终点、包类型限制和本地数值界限 | 核心帧线上字段与按包类型放置规则已实现；连接已支持握手/ACK/关闭子集；应用流及其它角色、方向和连接语义仍待完成 |
+| `frame` | RFC 9000 §12.4–12.5、§19.1–19.20；长度、ACK gap、流终点、包类型限制和本地数值界限 | 核心帧线上字段与按包类型放置规则已实现；连接已支持握手/ACK/关闭子集；有界应用流已接入；其它未覆盖的角色、方向和连接语义仍待完成 |
 | `header_protection` / `initial_packet` | RFC 9001 §5.3–5.4、附录 A.3；样本位置、首字节掩码宽度、整包收发顺序 | 基础操作及单个 Initial 整包已对照 RFC 向量；单路径连接收发已接线，其它套件未实现 |
 | `rtt_estimator` | RFC 9002 §5.3、§6.2.1 与勘误 7539；ACK Delay、更新顺序、PTO | 修正一处变动值更新顺序；恢复模块已接入 ACK 取样和定时器，已有 NewReno 基础窗口，未实现持续拥塞/ECN |
 
@@ -396,3 +396,5 @@ ctest --test-dir build --output-on-failure --timeout 30 -j2
 `PacketRecovery` 现在另存物理包的在途字节；共享帧身份已交付，只取消逻辑重发，不删除仍在网络中的副本。NewReno 初始窗口 12000 字节、最小窗口 2400，慢启动按确认字节增长、恢复期减半一次、拥塞避免保留小 ACK 信用。连接在分配包号前检查完整线上大小；窗口满时仍可发纯 ACK 和 PTO 探测，填充 Initial ACK 则计入窗口。详细手算、测试和范围见 [congestion-control.md](congestion-control.md)。
 
 后续已接入有界令牌桶 pacing：速率随窗口与 RTT 调整，发送唤醒与恢复期限合并，纯 ACK/PTO 探测保留例外。当前实现与验证见 [pacing.md](pacing.md)。
+
+后续已接入有界可靠应用流、FIN/RESET/STOP 与流量控制，当前能力、API、资源限制和验证见 [application-streams.md](application-streams.md)。

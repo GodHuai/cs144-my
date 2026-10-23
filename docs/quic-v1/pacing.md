@@ -1,6 +1,6 @@
 # 单路径发送节奏（pacing）
 
-在 NewReno 窗口之外，`quic/pacer.*` 用字节令牌桶限制发送突发。窗口限制尚在途的字节，pacing 限制当前能交付多少字节；ACK 释放前者，不保证后者立即恢复。当前仅覆盖既有固定 1200 字节路径和握手/控制帧，仍缺可靠应用流、持续拥塞检测、ECN 验证和迁移。
+在 NewReno 窗口之外，`quic/pacer.*` 用字节令牌桶限制发送突发。窗口限制尚在途的字节，pacing 限制当前能交付多少字节；ACK 释放前者，不保证后者立即恢复。该阶段仅覆盖既有固定 1200 字节路径和握手/控制帧，仍缺可靠应用流、持续拥塞检测、ECN 验证和迁移。
 
 ## 计算与边界
 
@@ -28,3 +28,5 @@
 审查发现窗口扩大时若先按新容量补充，会把旧空闲时间变成额外突发。回归先复现再修复：旧窗口 2400、RTT 100000，耗尽后空闲到 1000000 微秒并扩大窗口到 12000，只能拥有 2400 信用；12000 字节请求应等到 **1064000**。复核后无待处理发现。
 
 QUIC CTest **23/23** 通过（含编译夹具，对应 22 个测试程序）。全量 **54/61**（117.11 秒），未通过项仍是既有五个 30 秒超时：`wrapping_integers_roundtrip`、`wrapping_integers_extra`、`recv_transmit`、`recv_reorder_more`、`send_transmit`；`net_interface`、`router` 缺少可执行文件。日志为 `build/quic-pacing-ctest.log` 和 `build/quic-pacing-full-ctest.log`（忽略目录）。不将专项通过视为全量通过。
+
+后续有界应用流及其恢复/流量控制已接入，最新范围和验证见 [application-streams.md](application-streams.md)。

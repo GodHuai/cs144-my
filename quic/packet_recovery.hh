@@ -7,6 +7,7 @@
 
 #include <array>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 
@@ -47,7 +48,8 @@ public:
   std::vector<uint64_t> acknowledged( PacketKind kind,
                                       const AckFrame& ack,
                                       uint64_t now,
-                                      const RecoveryContext& context );
+                                      const RecoveryContext& context,
+                                      const std::function<void( const Frame& )>& delivered = {} );
   std::optional<uint64_t> deadline( const RecoveryContext& context ) const;
   Events timeout( uint64_t now, const RecoveryContext& context );
   std::optional<RecoverySend> take_pending( PacketKind kind );

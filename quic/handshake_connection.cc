@@ -54,6 +54,7 @@ struct HandshakeConnection::Impl
   PacketAcknowledgments acks {};
   PacketRecovery recovery {};
   PacketPacer pacer {};
+  std::unique_ptr<ApplicationStreams> streams {};
   std::optional<uint64_t> pacing_wakeup {};
   uint64_t last_clock {};
   bool peer_validated {}, amplification_blocked {};
@@ -126,6 +127,7 @@ struct HandshakeConnection::Impl
     error = code;
     clear_initial();
     tls.reset();
+    streams.reset();
     pending.clear();
     pending_bytes = 0;
     done_pending = ping_pending = false;
@@ -145,6 +147,9 @@ struct HandshakeConnection::Impl
         clear_handshake();
       }
     }
+    if ( tls && tls->complete() && !streams )
+      streams = std::make_unique<ApplicationStreams>(
+        config.tls.server, config.tls.local_parameters, *tls->peer_parameters() );
   }
   Impl( ConnectionConfig cfg, UdpEndpoint address )
     : config( std::move( cfg ) )
@@ -152,6 +157,7 @@ struct HandshakeConnection::Impl
     , state( config.tls.server ? ConnectionState::WaitingInitial : ConnectionState::Handshaking )
     , budget( config.tls.server ? AmplificationRole::Responder : AmplificationRole::Initiator )
   {
+    ApplicationStreams::validate_local( config.tls.local_parameters );
     if ( config.local_cid.size() < 8 || config.local_cid.size() > 20
          || ( !config.tls.server && ( config.initial_dcid.size() < 8 || config.initial_dcid.size() > 20 ) )
          || ( config.tls.server && !config.initial_dcid.empty() ) )
@@ -212,8 +218,15 @@ struct HandshakeConnection::Impl
       } else if ( !std::holds_alternative<PaddingFrame>( frame ) && !std::holds_alternative<PingFrame>( frame )
                   && !std::holds_alternative<CryptoFrame>( frame )
                   && !std::holds_alternative<HandshakeDoneFrame>( frame )
-                  && !std::holds_alternative<ConnectionCloseFrame>( frame ) ) {
+                  && !std::holds_alternative<ConnectionCloseFrame>( frame )
+                  && !( kind == PacketKind::OneRtt && streams && ApplicationStreams::handles( frame ) ) ) {
         stop( ConnectionState::Failed, 0x01 ); // Unsupported local feature, not a peer violation.
+        return false;
+      }
+    }
+    if ( streams && kind == PacketKind::OneRtt ) {
+      if ( auto code = streams->receive( frames ) ) {
+        stop( ConnectionState::Failed, *code );
         return false;
       }
     }
@@ -329,7 +342,11 @@ struct HandshakeConnection::Impl
         if ( kind == PacketKind::Handshake || kind == PacketKind::OneRtt )
           peer_validated = true;
         acks.apply_ack( kind, *ack );
-        release_records( kind, recovery.acknowledged( kind, *ack, now_us(), recovery_context() ) );
+        release_records(
+          kind, recovery.acknowledged( kind, *ack, now_us(), recovery_context(), [this]( const Frame& delivered ) {
+            if ( streams )
+              streams->acknowledged( delivered );
+          } ) );
       } else if ( const auto* crypto = std::get_if<CryptoFrame>( &frame ) ) {
         if ( !tls->receive( kind, *crypto ) ) {
           stop( ConnectionState::Failed, tls->transport_error().value_or( 0x01 ) );
@@ -382,6 +399,7 @@ struct HandshakeConnection::Impl
       auto ack = acks.pending_ack( kind, now_us(), exponent );
       std::optional<RecoverySend> retry;
       std::optional<CryptoFrame> crypto;
+      std::optional<Frame> app;
       bool done = false, ping = false;
       if ( acks.can_send( kind ) ) {
         retry = recovery.pending( kind ); // Peek; a blocked poll must not consume work.
@@ -390,9 +408,11 @@ struct HandshakeConnection::Impl
         else if ( !retry && kind == PacketKind::OneRtt ) {
           done = done_pending;
           ping = !done && ping_pending;
+          if ( !done && !ping && streams )
+            app = streams->pending();
         }
       }
-      if ( !retry && !crypto && !ack && !done && !ping )
+      if ( !retry && !crypto && !ack && !done && !ping && !app )
         continue;
       const auto make_payload = [&] {
         std::string payload;
@@ -406,6 +426,8 @@ struct HandshakeConnection::Impl
           payload += encode_frame( HandshakeDoneFrame {} );
         else if ( ping )
           payload += encode_frame( PingFrame {} );
+        else if ( app )
+          payload += encode_frame( *app );
         return payload;
       };
       auto payload = make_payload();
@@ -419,7 +441,7 @@ struct HandshakeConnection::Impl
               : build_short_header( *peer_id, 0, 4, false, false, payload.size() + 16 );
         return header.size() + payload.size() + 16;
       };
-      bool eliciting = retry || crypto || done || ping;
+      bool eliciting = retry || crypto || done || ping || app;
       if ( !recovery.can_send(
              kind, wire_size(), eliciting, kind == PacketKind::Initial, retry && retry->probe ) ) {
         // ACKs must still flow while fresh data or a normal retransmit is blocked.
@@ -427,6 +449,7 @@ struct HandshakeConnection::Impl
           continue;
         retry.reset();
         crypto.reset();
+        app.reset();
         done = ping = eliciting = false;
         payload = make_payload();
         if ( !recovery.can_send( kind, wire_size(), false, kind == PacketKind::Initial ) )
@@ -456,6 +479,7 @@ struct HandshakeConnection::Impl
           continue;
         retry.reset();
         crypto.reset();
+        app.reset();
         done = ping = eliciting = false;
         payload = make_payload();
         bytes = wire_size();
@@ -506,10 +530,14 @@ struct HandshakeConnection::Impl
         data = std::make_shared<RecoveryData>( HandshakeDoneFrame {} );
       else if ( ping )
         data = std::make_shared<RecoveryData>( PingFrame {} );
+      else if ( app )
+        data = std::make_shared<RecoveryData>( *app );
       acks.sent( kind, *number, eliciting );
       recovery.sent( kind, *number, now, data, bytes, kind == PacketKind::Initial );
       if ( eliciting || kind == PacketKind::Initial )
         pacer.sent( now, bytes, window, rtt_us );
+      if ( app )
+        streams->sent( *app );
       if ( ack )
         acks.ack_sent( kind, ack->generation );
       if ( crypto )
@@ -623,6 +651,34 @@ bool HandshakeConnection::send_ping()
     return false;
   impl_->ping_pending = true;
   return true;
+}
+std::optional<uint64_t> HandshakeConnection::open_stream( bool unidirectional )
+{
+  return impl_->streams ? impl_->streams->open( unidirectional ) : std::nullopt;
+}
+bool HandshakeConnection::write_stream( uint64_t id, std::string_view data, bool fin )
+{
+  return impl_->streams && impl_->streams->write( id, data, fin );
+}
+StreamRead HandshakeConnection::read_stream( uint64_t id, size_t maximum )
+{
+  return impl_->streams ? impl_->streams->read( id, maximum ) : StreamRead {};
+}
+std::vector<uint64_t> HandshakeConnection::stream_ids() const
+{
+  return impl_->streams ? impl_->streams->ids() : std::vector<uint64_t> {};
+}
+bool HandshakeConnection::reset_stream( uint64_t id, uint64_t error )
+{
+  return impl_->streams && impl_->streams->reset( id, error );
+}
+bool HandshakeConnection::stop_sending( uint64_t id, uint64_t error )
+{
+  return impl_->streams && impl_->streams->stop( id, error );
+}
+size_t HandshakeConnection::stream_send_buffered() const
+{
+  return impl_->streams ? impl_->streams->buffered() : 0;
 }
 ConnectionState HandshakeConnection::state() const
 {

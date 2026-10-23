@@ -119,7 +119,8 @@ void PacketRecovery::detect_lost( Space& s, uint64_t now, std::vector<uint64_t>&
 std::vector<uint64_t> PacketRecovery::acknowledged( PacketKind kind,
                                                     const AckFrame& ack,
                                                     uint64_t now,
-                                                    const RecoveryContext& c )
+                                                    const RecoveryContext& c,
+                                                    const std::function<void( const Frame& )>& delivered )
 {
   if ( ack.ranges.empty() || c.ack_delay_exponent > 20 || !std::isfinite( c.max_ack_delay_ms )
        || c.max_ack_delay_ms < 0 )
@@ -151,6 +152,8 @@ std::vector<uint64_t> PacketRecovery::acknowledged( PacketKind kind,
         any_new = true;
         if ( i->second.data ) {
           new_eliciting = true;
+          if ( !i->second.data->acknowledged && delivered )
+            delivered( i->second.data->frame );
           i->second.data->acknowledged = true;
         }
         if ( records == &s.active )

@@ -20,8 +20,10 @@ ACK 尽量与同级 CRYPTO 或控制帧一起发送，否则独立发包；当�
 
 `tests/quic_acknowledgments.cc` 覆盖区间合并、稀疏范围上限、独立空间、ACK Delay、重复/旧包、发送容量与释放、ACK 幂等及未发送包拒绝。连接测试解密检查 Initial ACK，验证受保护握手、双向 PING、重复包重新确认、坏标签丢弃、ACK-only 静止和 IPv4/IPv6 UDP 回环。
 
-RTT、发送时间、阈值丢包和握手 PTO 已实现；NewReno 基础窗口已接入；仍缺 CRYPTO 发送缓冲按 ACK 回收、可靠应用流、持续拥塞/ECN 验证与 ACK 频率协商。恢复只保证现有有界测试场景，不能据此宣称完整可靠传输。
+RTT、发送时间、阈值丢包和握手 PTO 已实现；NewReno 基础窗口已接入；仍缺 CRYPTO 发送缓冲按 ACK 回收、流数量补额/回收、持续拥塞/ECN 验证与 ACK 频率协商。恢复只保证现有有界测试场景，不能据此宣称完整可靠传输。
 
 握手恢复基准 `7abc5c7` 的验证记录为 QUIC CTest 21/21、全量 52/59；失败项目及恢复测试范围见 [loss-recovery.md](loss-recovery.md)。后续 NewReno 阶段验证为 QUIC 22/22、全量 53/60，见 [congestion-control.md](congestion-control.md)。
 
 后续已接入有界令牌桶 pacing：速率随窗口与 RTT 调整，发送唤醒与恢复期限合并，纯 ACK/PTO 探测保留例外。当前实现与验证见 [pacing.md](pacing.md)。
+
+后续已接入有界可靠应用流、FIN/RESET/STOP 与流量控制，当前能力、API、资源限制和验证见 [application-streams.md](application-streams.md)。

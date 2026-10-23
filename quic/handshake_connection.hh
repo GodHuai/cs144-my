@@ -1,5 +1,6 @@
 #pragma once
 
+#include "application_streams.hh"
 #include "congestion_control.hh"
 #include "rtt_estimator.hh"
 #include "tls_handshake.hh"
@@ -35,7 +36,7 @@ enum class ConnectionReceive
 };
 
 // Single-threaded, single pinned UDP peer; reusable sans-I/O handshake engine.
-// Bounded handshake loss recovery and basic NewReno; no streams, listener, migration or
+// Bounded reliable streams, flow control, recovery, NewReno and pacing; no listener, migration or
 // close timers yet. It is not a complete QUIC transport. Caller provides random
 // 8..20-byte CIDs and dispatches datagrams to the appropriate connection.
 class HandshakeConnection
@@ -55,6 +56,14 @@ public:
   CongestionStats congestion_stats() const;
   size_t packets_awaiting_ack( PacketKind kind ) const;
   bool send_ping(); // One bounded pending PING, only after TLS completion.
+  // Application operations require TLS completion; absent stream credits default to zero.
+  std::optional<uint64_t> open_stream( bool unidirectional );
+  bool write_stream( uint64_t id, std::string_view data, bool fin = false );
+  StreamRead read_stream( uint64_t id, size_t maximum );
+  std::vector<uint64_t> stream_ids() const;
+  bool reset_stream( uint64_t id, uint64_t error );
+  bool stop_sending( uint64_t id, uint64_t error );
+  size_t stream_send_buffered() const;
   ConnectionState state() const;
   std::optional<uint64_t> transport_error() const;
   std::string peer_cid() const;

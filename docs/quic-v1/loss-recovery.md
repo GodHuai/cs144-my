@@ -1,6 +1,6 @@
 # 握手丢包恢复与 RTT 接线
 
-`quic/packet_recovery.*` 在已有 ACK 连接上增加发送时间、RTT 样本、包号/时间阈值、重发队列和 PTO。当前覆盖握手 CRYPTO、HANDSHAKE_DONE 和 PING；已由后续 [NewReno 基础控制](congestion-control.md) 增加物理 bytes-in-flight 与发送窗口；仍没有持续拥塞、ECN 验证或可靠应用流，因此仍不是完整 RFC 9002 传输。
+`quic/packet_recovery.*` 在已有 ACK 连接上增加发送时间、RTT 样本、包号/时间阈值、重发队列和 PTO。当前覆盖握手 CRYPTO、HANDSHAKE_DONE 和 PING；已由后续 [NewReno 基础控制](congestion-control.md) 增加物理 bytes-in-flight 与发送窗口；仍没有持续拥塞、ECN 验证；有界应用流已接入（见 application-streams.md），因此仍不是完整 RFC 9002 传输。
 
 ## 事件循环接口
 
@@ -47,3 +47,5 @@ PTO 基于已有估计器，初始为 999ms，Initial/Handshake 不加 max_ack_d
 后续已实现基础 NewReno 的物理在途字节与窗口，该阶段验证为 QUIC 22/22、全量 53/60，详见 [congestion-control.md](congestion-control.md)。
 
 后续已接入有界令牌桶 pacing：速率随窗口与 RTT 调整，发送唤醒与恢复期限合并，纯 ACK/PTO 探测保留例外。当前实现与验证见 [pacing.md](pacing.md)。
+
+后续已接入有界可靠应用流、FIN/RESET/STOP 与流量控制，当前能力、API、资源限制和验证见 [application-streams.md](application-streams.md)。

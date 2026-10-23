@@ -118,3 +118,7 @@ ttest(quic_packet_recovery)
 ttest(quic_congestion_control)
 
 ttest(quic_pacer)
+
+ttest(quic_application_streams)
+
+ttest(quic_stream_connection)

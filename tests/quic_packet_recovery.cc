@@ -196,6 +196,24 @@ void physical_flight()
   bounded.discard( PacketKind::Initial );
   require( bounded.congestion_stats().bytes_in_flight == 0, "capacity discard leaked bytes" );
 }
+void logical_delivery_callback()
+{
+  PacketRecovery r;
+  RecoveryContext c;
+  c.confirmed = c.peer_validated = true;
+  auto shared = std::make_shared<RecoveryData>( StreamFrame { 0, 0, "abc", true, true, true } );
+  r.sent( PacketKind::OneRtt, 0, 0, shared, 30 );
+  r.sent( PacketKind::OneRtt, 1, 1, shared, 30 );
+  std::vector<std::string> delivered;
+  auto receive = [&]( const Frame& f ) { delivered.push_back( std::get<StreamFrame>( f ).data ); };
+  r.acknowledged( PacketKind::OneRtt, ack( 1, 1 ), 2, c, receive );
+  require( delivered == std::vector<std::string> { "abc" } && r.congestion_stats().bytes_in_flight == 30,
+           "logical callback must preserve other physical flight" );
+  r.acknowledged( PacketKind::OneRtt, ack( 0, 0 ), 3, c, receive );
+  r.acknowledged( PacketKind::OneRtt, ack( 0, 1 ), 4, c, receive );
+  require( delivered.size() == 1 && r.congestion_stats().bytes_in_flight == 0,
+           "duplicate logical copy called delivery twice" );
+}
 }
 int main()
 {
@@ -205,6 +223,7 @@ int main()
     late_delivery_and_backoff();
     early_loss_timer_callback();
     physical_flight();
+    logical_delivery_callback();
   } catch ( const std::exception& e ) {
     std::cerr << e.what() << '\n';
     return 1;
