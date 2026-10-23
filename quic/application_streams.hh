@@ -38,7 +38,7 @@ private:
     std::string queued {};
     std::map<uint64_t, std::string> inflight {}, received {};
     std::optional<uint64_t> final {}, reset_error {}, blocked {};
-    bool fin_requested {}, fin_sent {}, fin_acked {}, send_reset {};
+    bool fin_requested {}, fin_sent {}, fin_acked {}, send_reset {}, reset_acked {}, receive_observed {};
   };
   struct Error
   {
@@ -47,6 +47,10 @@ private:
   bool server_;
   TransportParameters local_, peer_;
   std::map<uint64_t, Stream> streams_ {};
+  std::array<std::map<uint64_t, uint64_t>, 4> retired_ {};
+  std::array<uint64_t, 4> retired_counts_ {};
+  void retire_ready( uint64_t id );
+  bool retired( uint64_t id ) const;
   std::array<uint64_t, 2> opened_ {}, peer_opened_ {}, send_counts_ {}, recv_counts_ {};
   uint64_t send_limit_ {}, sent_ {}, recv_limit_ {}, consumed_ {}, received_ {};
   size_t buffered_ {};

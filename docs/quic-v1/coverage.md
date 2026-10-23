@@ -6,10 +6,10 @@
 
 | 规范 | 主题 | 任务 | 状态 |
 | --- | --- | --- | --- |
-| RFC 9000 §5–8、RFC 9001 §4 | 单路径握手连接编排 | 3–4 | 部分实现：`quic/handshake_connection.*` 接管实际 CID/TLS 绑定、三空间、认证和完整帧预检、待密钥队列、反放大、握手确认及 Initial/Handshake 密钥丢弃；真实 IPv4/IPv6 测试使用库中连接类。即时 ACK 和有界发送记录已接线；握手阈值恢复/RTT/PTO 已接线，见 `loss-recovery.md`；NewReno 基础窗口已接入；持续拥塞/ECN、流数量补额/回收、监听与关闭计时待完成，详见 `handshake-connection.md` |
+| RFC 9000 §5–8、RFC 9001 §4 | 单路径握手连接编排 | 3–4 | 部分实现：`quic/handshake_connection.*` 接管实际 CID/TLS 绑定、三空间、认证和完整帧预检、待密钥队列、反放大、握手确认及 Initial/Handshake 密钥丢弃；真实 IPv4/IPv6 测试使用库中连接类。即时 ACK 和有界发送记录已接线；握手阈值恢复/RTT/PTO 已接线，见 `loss-recovery.md`；NewReno 基础窗口已接入；持续拥塞/ECN、监听与关闭计时待完成，详见 `handshake-connection.md` |
 | UDP / RFC 9000 §13.4、§14 | IPv4/IPv6 数据报与 ECN 元数据 | 1 | 部分实现：`quic/udp_socket.*` 提供 Linux 非阻塞收发、逐包 ECN、scope、截断丢弃；`tests/quic_udp_handshake.cc` 通过真实双栈 UDP 运行受保护 TLS 与 1-RTT 控制帧。监听器与动态多连接路由、ACK_ECN/拥塞验证、PMTU 与外部互通待实现。详见 `udp.md` |
 | RFC 9000 §7.5、§19.6 | CRYPTO 字节缓冲与分片 | 3 | 部分实现：每级别至少 4096 字节的乱序缓冲、62 位 offset 界限、唯一字节容量记账和原子错误、发送重分片及级别丢弃见 `quic/crypto_streams.*`。TLS 握手接线见 `quic/tls_handshake.*`；ACK/握手丢包调度已由连接接入；错误到 CONNECTION_CLOSE 和发送缓冲按 ACK 回收待完成 |
-| RFC 9000 §2–4 | 流、状态与流量控制 | 4–5 | 部分实现：可靠双向/单向字节传输、重组、FIN/RESET/STOP、流/连接额度、MAX/BLOCKED 已接入；有界缓冲与累计流数限制，仍缺流数量补额/终态回收和完整边界审计。见 [application-streams.md](application-streams.md) |
+| RFC 9000 §2–4 | 流、状态与流量控制 | 4–5 | 部分实现：可靠双向/单向字节传输、重组、FIN/RESET/STOP、流/连接额度、MAX/BLOCKED 已接入；有界缓冲、终态回收和 MAX_STREAMS 补额已接入；仍需完整边界审计。见 [application-streams.md](application-streams.md) |
 | RFC 9000 §5–8、§18 | 连接 ID、版本、握手、传输参数、地址验证 | 2–3、9 | 部分实现：`quic/transport_parameters.*` 解析/编码 §18 核心参数，检查重复、格式、数值界限、角色和与所给 Initial/Retry CID 的一致性；`quic/path_validation.*` 记录 §8.2 单路径挑战与回应、地址和最低 MTU 验证、超时；`quic/anti_amplification.*` 按地址记 §8 的三倍发送额度。`quic/tls_handshake.*` 已接入 TLS 扩展并验证所给 CID 上下文；单路径连接已绑定实际 Initial CID、消费 ACK 参数并接入反放大与 UDP；安全随机挑战生成、迁移路径接线、其它参数消费与 0-RTT 会话恢复规则待完成。详见 `transport-parameters.md`、`path-validation.md`、`anti-amplification.md` |
 | RFC 9000 §9–11、§5.1 | 迁移、路径、连接 ID 与终止 | 9–10 | 部分实现：`quic/peer_connection_ids.*` 管对端签发的 ID 与路径绑定；`quic/local_connection_ids.*` 管本端签发的 ID、退休帧检查及活动 ID 查找；§8 的额度和验证状态基础见上一行。实际迁移、地址切换、反放大与路径状态接线、UDP 路由、随机 CID/token 生成及新路径拥塞状态仍待完成。详见 `connection-ids.md`、`local-connection-ids.md` |
 | RFC 9000 §12–13 | 包、帧、ACK、可靠性与 ECN | 2、6–7 | 部分实现：包号编码、§12.3 三空间映射/发送分配/认证后接收去重、受保护包边界定位、核心帧 `0x00`–`0x1e` 线上格式编解码及 §12.4 表 3 包类型放置校验见 `quic/packet_number.*`、`quic/packet_number_space.*`、`quic/packet_header.*`、`quic/frame.*`；`quic/acknowledgments.*` 已实现即时 ACK、最近 4096 包号窗口、32 范围上限和有界发送确认记录；`quic/packet_recovery.*` 已接入有界握手帧恢复、RTT 和 PTO；已接入物理在途字节及 NewReno 发送限制；剩余角色/方向规则、完整拥塞控制和应用可靠性待完成 |
@@ -27,3 +27,5 @@
 后续已接入有界令牌桶 pacing：速率随窗口与 RTT 调整，发送唤醒与恢复期限合并，纯 ACK/PTO 探测保留例外。当前实现与验证见 [pacing.md](pacing.md)。
 
 后续已接入有界可靠应用流、FIN/RESET/STOP 与流量控制，当前能力、API、资源限制和验证见 [application-streams.md](application-streams.md)。
+
+后续已实现流终态回收、紧凑关闭 ID 区间与可靠 MAX_STREAMS 补额，最新语义和验证见 [stream-retirement.md](stream-retirement.md)。

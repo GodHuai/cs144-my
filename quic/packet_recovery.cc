@@ -137,6 +137,7 @@ std::vector<uint64_t> PacketRecovery::acknowledged( PacketKind kind,
   std::vector<Space::Flight> newly_acked_flight;
   bool new_eliciting = false, any_new = false;
   std::vector<uint64_t> released;
+  std::vector<uint64_t> reset_delivered;
   for ( const auto& range : ack.ranges ) {
     if ( range.smallest > range.largest )
       throw std::invalid_argument( "invalid recovery ACK range" );
@@ -152,8 +153,12 @@ std::vector<uint64_t> PacketRecovery::acknowledged( PacketKind kind,
         any_new = true;
         if ( i->second.data ) {
           new_eliciting = true;
-          if ( !i->second.data->acknowledged && delivered )
-            delivered( i->second.data->frame );
+          if ( !i->second.data->acknowledged ) {
+            if ( const auto* reset = std::get_if<ResetStreamFrame>( &i->second.data->frame ) )
+              reset_delivered.push_back( reset->stream_id );
+            if ( delivered )
+              delivered( i->second.data->frame );
+          }
           i->second.data->acknowledged = true;
         }
         if ( records == &s.active )
@@ -174,6 +179,25 @@ std::vector<uint64_t> PacketRecovery::acknowledged( PacketKind kind,
     validation_anchor_ = now;
     if ( c.peer_validated )
       pto_count_ = 0;
+  }
+  // RESET delivery obsoletes old STREAM payloads, without acknowledging their physical flight.
+  const auto cancel = [&]( const std::shared_ptr<RecoveryData>& data ) {
+    if ( !data )
+      return;
+    if ( const auto* stream = std::get_if<StreamFrame>( &data->frame );
+         stream
+         && std::find( reset_delivered.begin(), reset_delivered.end(), stream->stream_id )
+              != reset_delivered.end() )
+      data->acknowledged = true;
+  };
+  if ( !reset_delivered.empty() ) {
+    for ( auto* records : { &s.active, &s.recent } )
+      for ( auto& [pn, record] : *records ) {
+        (void)pn;
+        cancel( record.data );
+      }
+    for ( auto& pending : s.pending )
+      cancel( pending.data );
   }
   // Acknowledgment of any transmission delivers its shared logical frame.
   for ( auto i = s.active.begin(); i != s.active.end(); ) {

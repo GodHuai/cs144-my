@@ -1,6 +1,6 @@
 # QUIC v1 实现讲解（进行中）
 
-握手恢复基准 `7abc5c7`（2026-10-22），以下包含后续 NewReno 阶段。目前基础编码、包保护、CRYPTO/TLS、双栈 UDP 和单路径 `HandshakeConnection` 已贯通；即时 ACK、发送时间、RTT、阈值丢包和有界握手 PTO 已接入连接；随后加入固定单路径 NewReno 的物理在途字节、窗口及 ACK/PTO 例外。**应用流数量补额/回收、持续拥塞/ECN 与第三方互通仍未完成。**
+握手恢复基准 `7abc5c7`（2026-10-22），以下包含后续 NewReno 阶段。目前基础编码、包保护、CRYPTO/TLS、双栈 UDP 和单路径 `HandshakeConnection` 已贯通；即时 ACK、发送时间、RTT、阈值丢包和有界握手 PTO 已接入连接；随后加入固定单路径 NewReno 的物理在途字节、窗口及 ACK/PTO 例外。**持续拥塞/ECN 与第三方互通仍未完成。**
 
 基础工具按下面的手算顺序阅读。整包与状态机专题依次见 [Initial 保护](initial-packet-protection.md)、[Initial 整包](initial-packet.md)、[CRYPTO](crypto-streams.md)、[TLS](tls-handshake.md)、[Handshake/1-RTT 包](protected-packets.md)、[UDP](udp.md)、[连接引擎](handshake-connection.md)、[ACK](acknowledgments.md)、[丢包恢复](loss-recovery.md)。独立的路径/CID/Retry 原语并不表示对应迁移和协商状态机已经接线。
 
@@ -337,11 +337,11 @@ PTO（Probe Timeout）是“等待确认过久时，什么时候尝试发探测�
 
 | 规范范围 | 已有的可调用代码 | 必须继续实现的内容 |
 | --- | --- | --- |
-| RFC 9000 | 基础编码、核心帧格式、参数/CID 校验、单路径连接、真实双栈 UDP、即时 ACK、有界发送与接收窗口 | 应用流数量补额/回收、完整角色/方向语义、VN/Retry 接受、迁移、动态路由、PMTU、关闭/空闲计时 |
+| RFC 9000 | 基础编码、核心帧格式、参数/CID 校验、单路径连接、真实双栈 UDP、即时 ACK、有界发送与接收窗口 | 完整角色/方向语义、VN/Retry 接受、迁移、动态路由、PMTU、关闭/空闲计时 |
 | RFC 9001 | Initial/Handshake/1-RTT AES 包保护、CRYPTO、真实 TLS 1.3、证书/ALPN、实际 CID 绑定、握手确认及密钥丢弃 | 其它套件、后握手 TLS、密钥更新/使用上限、会话恢复和 0-RTT |
 | RFC 9002 | 发送时间、ACK 样本筛选、RTT、包号/时间阈值、握手 PTO/退避、迟到 ACK 与共享逻辑帧身份 | CRYPTO 发送缓冲按 ACK 回收、持续拥塞、ECN 验证 |
 
-ACK 会对实际已交付包号预检并更新发送历史，物理在途字节及拥塞窗口现由 NewReno 接入。STREAM 已接入有界应用字节交付、恢复和额度约束；流数量补额/回收仍待完成。完整目标见 `requirements.md`；当前事实以源码、测试和 `coverage.md` 为准。
+ACK 会对实际已交付包号预检并更新发送历史，物理在途字节及拥塞窗口现由 NewReno 接入。STREAM 已接入有界应用字节交付、恢复和额度约束；流终态回收及 MAX_STREAMS 补额现已接入，见 [stream-retirement.md](stream-retirement.md)。完整目标见 `requirements.md`；当前事实以源码、测试和 `coverage.md` 为准。
 
 ## 验证记录与可复现命令
 
@@ -398,3 +398,5 @@ ctest --test-dir build --output-on-failure --timeout 30 -j2
 后续已接入有界令牌桶 pacing：速率随窗口与 RTT 调整，发送唤醒与恢复期限合并，纯 ACK/PTO 探测保留例外。当前实现与验证见 [pacing.md](pacing.md)。
 
 后续已接入有界可靠应用流、FIN/RESET/STOP 与流量控制，当前能力、API、资源限制和验证见 [application-streams.md](application-streams.md)。
+
+后续已实现流终态回收、紧凑关闭 ID 区间与可靠 MAX_STREAMS 补额，最新语义和验证见 [stream-retirement.md](stream-retirement.md)。

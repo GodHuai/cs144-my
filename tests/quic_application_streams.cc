@@ -167,6 +167,109 @@ void aggregate_admission()
   check( s.buffered() == 0 && s.write( 4, std::string( 1048576, 'z' ), true ),
          "ACK did not reopen bounded admission" );
 }
+void forward_controls( ApplicationStreams& from, ApplicationStreams& to )
+{
+  for ( size_t n = 0; auto f = from.pending(); ++n ) {
+    check( n < 100, "control loop" );
+    from.sent( *f );
+    check( !to.receive( { *f } ), "control update rejected" );
+  }
+}
+void retire_and_replenish()
+{
+  ApplicationStreams c( false, limits( 24, 12, 1 ), limits( 24, 12, 1 ) );
+  ApplicationStreams server( true, limits( 24, 12, 1 ), limits( 24, 12, 1 ) );
+  for ( uint64_t n = 0; n < 300; ++n ) {
+    auto id = c.open( true );
+    check( id == 4 * n + 2, "closed uni slot not replenished" );
+    check( c.write( *id, "x", true ), "sequential uni write failed" );
+    auto f = *c.pending();
+    c.sent( f );
+    check( !server.receive( { f } ), "sequential uni receive failed" );
+    c.acknowledged( f );
+    check( c.ids().empty(), "send-only terminal state retained" );
+    check( server.ids().size() == 1, "unread stream reclaimed" );
+    auto r = server.read( *id, 1 );
+    check( r.data == "x" && r.eof, "final application read lost" );
+    check( server.ids().empty(), "observed uni stream retained" );
+    check( !server.receive( { f } ) && server.ids().empty(), "late frame reopened retired stream" );
+    check( !server.write( *id, "bad", false ) && server.receive( { StopSendingFrame { *id, 9 } } ) == 5,
+           "retired uni wrong direction accepted" );
+    forward_controls( server, c );
+  }
+}
+void terminal_halves_and_holes()
+{
+  ApplicationStreams c( false, limits( 4000, 4000, 3 ), limits( 4000, 4000, 3 ) );
+  ApplicationStreams server( true, limits( 4000, 4000, 3 ), limits( 4000, 4000, 3 ) );
+  check( c.open( false ) == 0 && c.write( 0, "", true ), "bidi setup failed" );
+  auto first = *c.pending();
+  c.sent( first );
+  check( !server.receive( { first } ), "bidi FIN rejected" );
+  c.acknowledged( first );
+  check( c.ids() == std::vector<uint64_t> { 0 }, "bidi closed before receive half" );
+  check( server.read( 0, 1 ).eof && server.ids() == std::vector<uint64_t> { 0 }, "bidi closed before send half" );
+  check( !server.receive( { ResetStreamFrame { 0, 99, 0 } } ), "late terminal-half RESET failed" );
+  check( server.write( 0, "", true ), "bidi response FIN rejected" );
+  auto response = *server.pending();
+  server.sent( response );
+  check( !c.receive( { response } ), "response FIN failed" );
+  check( c.read( 0, 1 ).eof && c.ids().empty(), "bidi complete not reclaimed" );
+  server.acknowledged( response );
+  check( server.ids().empty(), "bidi ACK not reclaimed" );
+  check( !server.receive( { first } ) && server.ids().empty(), "late bidi FIN resurrected" );
+  check( !c.write( 0, "bad", false ), "retired application write reopened" );
+  // High ID implicitly opens lower streams; retiring it cannot erase the holes.
+  check( !server.receive( { sf( 10, 0, "", true ) } ), "implicit high uni rejected" );
+  check( server.read( 10, 0 ).eof && server.ids().empty(), "high uni not reclaimed" );
+  check( !server.receive( { sf( 2, 0, "old", true ) } ), "implicit lower stream mistaken for retired" );
+  check( server.read( 2, 10 ).data == "old", "implicit lower bytes lost" );
+  check( !server.receive( { sf( 6, 0, "mid", true ) } ), "middle gap erased" );
+  check( server.read( 6, 10 ).data == "mid" && server.ids().empty(), "merged closed intervals lost gap" );
+  check( !server.receive( { sf( 6, 0, "mid", true ) } ) && server.ids().empty(), "merged tombstone reopened" );
+  check( server.receive( { sf( 2, max_varint, "x" ) } ) == 7, "retired STREAM bypassed offset validation" );
+  ApplicationStreams fin( false, limits( 4000, 4000 ), limits( 4000, 4000 ) );
+  check( fin.open( true ) == 2 && fin.write( 2, std::string( 1200, 'x' ), true ), "prefix FIN setup" );
+  auto prefix = *fin.pending();
+  fin.sent( prefix );
+  auto tail = *fin.pending();
+  fin.sent( tail );
+  fin.acknowledged( tail );
+  check( fin.ids() == std::vector<uint64_t> { 2 } && fin.buffered() == 600, "FIN tail hid unacked prefix" );
+  fin.acknowledged( prefix );
+  check( fin.ids().empty() && fin.buffered() == 0, "prefix ACK failed to retire" );
+}
+void reset_retirement()
+{
+  ApplicationStreams c( false, limits(), limits() );
+  check( c.open( true ) == 2 && c.write( 2, "abc", false ), "reset setup failed" );
+  auto data = *c.pending();
+  c.sent( data );
+  check( c.reset( 2, 7 ), "reset queue failed" );
+  auto reset = *c.pending();
+  c.sent( reset );
+  check( c.buffered() == 3 && !c.ids().empty(), "reset reclaimed before delivery" );
+  c.acknowledged( reset );
+  check( c.buffered() == 0 && c.ids().empty(), "RESET delivery did not reclaim stream and buffer" );
+  c.acknowledged( data );
+  check( c.buffered() == 0 && c.ids().empty(), "late ACK reopened retired reset" );
+  ApplicationStreams server( true, limits(), limits() );
+  check( !server.receive( { ResetStreamFrame { 2, 9, 3 } } ) && server.ids().size() == 1, "unobserved reset lost" );
+  check( server.read( 2, 0 ).reset_error == 9 && server.ids().empty(),
+         "reset application result lost on retirement" );
+}
+void high_peer_credit()
+{
+  ApplicationStreams c( false, limits(), limits( 24, 12, uint64_t { 1 } << 60 ) );
+  for ( uint64_t n = 0; n < 128; ++n )
+    check( c.open( true ) == 4 * n + 2, "valid large peer initial credit rejected" );
+  check( !c.open( true ), "local active resource cap ignored" );
+  check( c.write( 2, "", true ), "high-credit close failed" );
+  auto f = *c.pending();
+  c.sent( f );
+  c.acknowledged( f );
+  check( c.open( true ) == 514, "resource slot not reusable under large initial peer credit" );
+}
 void read_credit()
 {
   ApplicationStreams s( true, limits( 4, 4 ), limits() );
@@ -201,6 +304,10 @@ int main()
     send_and_credit();
     asymmetric_credit_and_counts();
     aggregate_admission();
+    retire_and_replenish();
+    terminal_halves_and_holes();
+    reset_retirement();
+    high_peer_credit();
     read_credit();
   } catch ( const std::exception& e ) {
     std::cerr << e.what() << '\n';

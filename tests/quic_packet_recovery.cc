@@ -214,6 +214,43 @@ void logical_delivery_callback()
   require( delivered.size() == 1 && r.congestion_stats().bytes_in_flight == 0,
            "duplicate logical copy called delivery twice" );
 }
+void reset_cancels_logical_copies()
+{
+  PacketRecovery r;
+  RecoveryContext c;
+  c.confirmed = c.peer_validated = true;
+  auto payload = std::make_shared<RecoveryData>( StreamFrame { 2, 0, "payload", false, true, true } );
+  r.sent( PacketKind::OneRtt, 0, 1000, payload, 600 );
+  auto due = *r.deadline( c );
+  r.timeout( due, c );
+  auto probe = r.pending( PacketKind::OneRtt );
+  require( probe && probe->data == payload, "setup did not queue old STREAM probe" );
+  auto reset = std::make_shared<RecoveryData>( ResetStreamFrame { 2, 9, 7 } );
+  r.sent( PacketKind::OneRtt, 1, due, reset, 30 );
+  size_t stream_delivered = 0, reset_delivered = 0;
+  auto callback = [&]( const Frame& f ) {
+    stream_delivered += std::holds_alternative<StreamFrame>( f );
+    reset_delivered += std::holds_alternative<ResetStreamFrame>( f );
+  };
+  r.acknowledged( PacketKind::OneRtt, ack( 1, 1 ), due + 1, c, callback );
+  require( !r.pending( PacketKind::OneRtt ), "RESET delivery left obsolete STREAM probe" );
+  // The old flight is old enough for time-threshold loss here, which removes it independently.
+  require( reset_delivered == 1 && stream_delivered == 0, "RESET cancellation faked STREAM delivery" );
+  r.acknowledged( PacketKind::OneRtt, ack( 0, 0 ), due + 2, c, callback );
+  require( stream_delivered == 0, "late canceled STREAM ACK invoked delivery" );
+
+  PacketRecovery physical;
+  physical.sent( PacketKind::OneRtt,
+                 0,
+                 1000,
+                 std::make_shared<RecoveryData>( StreamFrame { 2, 0, "x", false, true, true } ),
+                 600 );
+  physical.sent( PacketKind::OneRtt, 1, 1001, std::make_shared<RecoveryData>( ResetStreamFrame { 2, 9, 1 } ), 30 );
+  physical.acknowledged( PacketKind::OneRtt, ack( 1, 1 ), 1002, c );
+  require( physical.congestion_stats().bytes_in_flight == 600, "RESET ACK erased independent physical flight" );
+  physical.acknowledged( PacketKind::OneRtt, ack( 0, 0 ), 1003, c );
+  require( physical.congestion_stats().bytes_in_flight == 0, "late physical ACK failed to release flight" );
+}
 }
 int main()
 {
@@ -224,6 +261,7 @@ int main()
     early_loss_timer_callback();
     physical_flight();
     logical_delivery_callback();
+    reset_cancels_logical_copies();
   } catch ( const std::exception& e ) {
     std::cerr << e.what() << '\n';
     return 1;

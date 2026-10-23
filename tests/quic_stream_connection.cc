@@ -11,7 +11,7 @@ void check( bool ok, const char* why )
     throw std::runtime_error( why );
 }
 const auto ca = UdpEndpoint::numeric( "127.0.0.1", 11111 ), sa = UdpEndpoint::numeric( "127.0.0.1", 22222 );
-ConnectionConfig config( bool server, uint64_t& now, uint64_t window )
+ConnectionConfig config( bool server, uint64_t& now, uint64_t window, uint64_t count = 4 )
 {
   ConnectionConfig c;
   c.local_cid = server ? "serverid" : "clientid";
@@ -25,7 +25,7 @@ ConnectionConfig config( bool server, uint64_t& now, uint64_t window )
   c.tls.private_key_file = std::string { QUIC_TLS_TEST_CERT_DIR } + "/server.key";
   for ( uint64_t id = 4; id <= 7; ++id )
     c.tls.local_parameters[id] = encode_varint( window );
-  c.tls.local_parameters[8] = c.tls.local_parameters[9] = encode_varint( 4 );
+  c.tls.local_parameters[8] = c.tls.local_parameters[9] = encode_varint( count );
   return c;
 }
 std::vector<UdpDatagram> drain( HandshakeConnection& c )
@@ -46,7 +46,8 @@ struct Pair
 {
   uint64_t now = 1000;
   HandshakeConnection c, s;
-  explicit Pair( uint64_t window ) : c( config( false, now, window ), sa ), s( config( true, now, window ), ca )
+  explicit Pair( uint64_t window, uint64_t count = 4 )
+    : c( config( false, now, window, count ), sa ), s( config( true, now, window, count ), ca )
   {
     check( !c.open_stream( false ), "stream opened before handshake" );
     for ( size_t i = 0; i < 10; ++i )
@@ -158,13 +159,70 @@ void tiny_credit_and_cancel()
   }
   check( reset, "unsent reset not delivered" );
 }
+void continuing_streams()
+{
+  Pair p( 24, 1 );
+  bool dropped_credit = false;
+  for ( uint64_t n = 0; n < 129; ++n ) {
+    std::optional<uint64_t> bidi, uni;
+    for ( size_t wait = 0; wait < 4000 && ( !bidi || !uni ); ++wait ) {
+      if ( !bidi )
+        bidi = p.c.open_stream( false );
+      if ( !uni )
+        uni = p.s.open_stream( true );
+      if ( !bidi || !uni )
+        p.pump();
+    }
+    check( bidi == 4 * n && uni == 4 * n + 3, "replenished stream IDs stalled or reused" );
+    const std::string request_data = n % 10 == 0 ? "x" : "", reply_data = n % 10 == 0 ? "r" : "",
+                      uni_data = n % 10 == 0 ? "u" : "";
+    check( p.c.write_stream( *bidi, request_data, true ) && p.s.write_stream( *uni, uni_data, true ),
+           "sequential protected write failed" );
+    bool request = false, response = false, unidone = false;
+    for ( size_t wait = 0; wait < 4000 && ( !request || !response || !unidone ); ++wait ) {
+      p.pump();
+      if ( !request ) {
+        auto r = p.s.read_stream( *bidi, 1 );
+        request = r.eof;
+        if ( request )
+          check( r.data == request_data && p.s.write_stream( *bidi, reply_data, true ), "sequential request lost" );
+      }
+      if ( !response ) {
+        auto r = p.c.read_stream( *bidi, 1 );
+        if ( r.eof ) {
+          check( r.data == reply_data, "sequential response lost" );
+          response = true;
+        }
+      }
+      if ( !unidone ) {
+        auto r = p.c.read_stream( *uni, 1 );
+        if ( r.eof ) {
+          check( r.data == uni_data, "sequential uni lost" );
+          unidone = true;
+        }
+      }
+      if ( n == 0 && unidone && !dropped_credit ) {
+        (void)drain( p.c );
+        dropped_credit = true;
+      } // Lose MAX_STREAMS and ACK; recover through PTO.
+    }
+    check( request && response && unidone, "sequential application completion stalled" );
+    for ( size_t wait = 0; wait < 4000 && ( !p.c.stream_ids().empty() || !p.s.stream_ids().empty() ); ++wait )
+      p.pump();
+    check( p.c.stream_ids().empty() && p.s.stream_ids().empty(), "completed protected streams retained" );
+  }
 }
-int main()
+}
+int main( int argc, char** )
 {
   try {
-    reliable( false );
-    reliable( true );
-    tiny_credit_and_cancel();
+    if ( argc > 1 )
+      continuing_streams();
+    else {
+      reliable( false );
+      reliable( true );
+      tiny_credit_and_cancel();
+    }
   } catch ( const std::exception& e ) {
     std::cerr << e.what() << '\n';
     return 1;

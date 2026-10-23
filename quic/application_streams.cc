@@ -67,6 +67,8 @@ ApplicationStreams::Stream& ApplicationStreams::get( uint64_t id, bool sending, 
     else if ( id / 4 >= peer_opened_[dir] )
       throw Error { 5 };
   }
+  if ( retired( id ) )
+    throw Error { 5 };
   auto [it, inserted] = streams_.try_emplace( id );
   if ( inserted )
     it->second = make( id );
@@ -107,7 +109,7 @@ std::optional<uint64_t> ApplicationStreams::open( bool uni )
     }
     return std::nullopt;
   }
-  if ( opened_[dir] >= 128 )
+  if ( opened_[dir] - retired_counts_[( server_ ? 1 : 0 ) + ( uni ? 2 : 0 )] >= 128 )
     return std::nullopt;
   const uint64_t id = 4 * opened_[dir]++ + ( server_ ? 1 : 0 ) + ( uni ? 2 : 0 );
   streams_.emplace( id, make( id ) );
@@ -142,8 +144,12 @@ StreamRead ApplicationStreams::read( uint64_t id, size_t maximum )
 {
   try {
     auto& s = get( id, false, false );
-    if ( s.reset_error )
-      return { {}, false, s.reset_error };
+    if ( s.reset_error ) {
+      StreamRead out { {}, false, s.reset_error };
+      s.receive_observed = true;
+      retire_ready( id );
+      return out;
+    }
     StreamRead out;
     auto it = s.received.begin();
     if ( maximum && it != s.received.end() && it->first == s.read ) {
@@ -158,6 +164,8 @@ StreamRead ApplicationStreams::read( uint64_t id, size_t maximum )
       credit( s, id, count );
     }
     out.eof = s.final && s.read == *s.final;
+    s.receive_observed = s.receive_observed || out.eof;
+    retire_ready( id );
     return out;
   } catch ( const Error& ) {
     return {};
@@ -216,9 +224,24 @@ void ApplicationStreams::accept( uint64_t id, uint64_t end, bool final )
 }
 void ApplicationStreams::apply( const Frame& f )
 {
+  if ( const auto* stream = std::get_if<StreamFrame>( &f );
+       stream && ( stream->offset > max_varint || stream->data.size() > max_varint - stream->offset ) )
+    throw Error { 7 };
+  std::optional<uint64_t> target;
+  std::visit(
+    [&]( const auto& x ) {
+      if constexpr ( requires { x.stream_id; } )
+        target = x.stream_id;
+    },
+    f );
+  if ( target && retired( *target ) ) {
+    const bool sending
+      = std::holds_alternative<StopSendingFrame>( f ) || std::holds_alternative<MaxStreamDataFrame>( f );
+    if ( sending ? !sends( *target ) : !receives( *target ) )
+      throw Error { 5 };
+    return; // Closed stream final-size detail has been deliberately discarded.
+  }
   if ( const auto* input_1 = std::get_if<StreamFrame>( &f ) ) {
-    if ( input_1->offset > max_varint || input_1->data.size() > max_varint - input_1->offset )
-      throw Error { 7 };
     const uint64_t end = input_1->offset + input_1->data.size();
     accept( input_1->stream_id, end, input_1->fin );
     auto& s = streams_.at( input_1->stream_id );
@@ -249,7 +272,7 @@ void ApplicationStreams::apply( const Frame& f )
   } else if ( const auto* input_2 = std::get_if<ResetStreamFrame>( &f ) ) {
     accept( input_2->stream_id, input_2->final_size, true );
     auto& s = streams_.at( input_2->stream_id );
-    if ( !s.reset_error ) {
+    if ( !s.reset_error && !s.receive_observed ) {
       s.reset_error = input_2->error_code;
       s.received.clear();
       credit( s, input_2->stream_id, *s.final - s.read );
@@ -336,6 +359,54 @@ void ApplicationStreams::sent( const Frame& frame )
   } else
     controls_.erase( key( frame ) );
 }
+bool ApplicationStreams::retired( uint64_t id ) const
+{
+  if ( id > max_varint )
+    return false;
+  const auto& ranges = retired_[id & 3];
+  auto it = ranges.upper_bound( id / 4 );
+  return it != ranges.begin() && std::prev( it )->second >= id / 4;
+}
+void ApplicationStreams::retire_ready( uint64_t id )
+{
+  auto stream = streams_.find( id );
+  if ( stream == streams_.end() )
+    return;
+  const auto& s = stream->second;
+  const bool send_done = !sends( id ) || ( s.send_reset ? s.reset_acked : ( s.fin_acked && s.inflight.empty() ) );
+  if ( !send_done || ( receives( id ) && !s.receive_observed ) )
+    return;
+  auto& ranges = retired_[id & 3];
+  uint64_t begin = id / 4, end = begin;
+  auto it = ranges.lower_bound( begin );
+  if ( it != ranges.begin() && std::prev( it )->second + 1 >= begin )
+    it = std::prev( it );
+  while ( it != ranges.end() && it->first <= end + 1 ) {
+    begin = std::min( begin, it->first );
+    end = std::max( end, it->second );
+    it = ranges.erase( it );
+  }
+  ranges.emplace( begin, end );
+  ++retired_counts_[id & 3];
+  streams_.erase( stream );
+  std::erase_if( controls_, [&]( const auto& item ) {
+    return std::visit(
+      [&]( const auto& x ) {
+        if constexpr ( requires { x.stream_id; } )
+          return x.stream_id == id;
+        else
+          return false;
+      },
+      item.second );
+  } );
+  if ( !local( id ) ) {
+    auto& count = recv_counts_[( id & 2 ) ? 1 : 0];
+    if ( count < ( uint64_t { 1 } << 60 ) ) {
+      ++count;
+      queue( MaxStreamsFrame { bool( id & 2 ), count } );
+    }
+  }
+}
 void ApplicationStreams::acknowledged( const Frame& frame )
 {
   if ( const auto* f = std::get_if<StreamFrame>( &frame ) ) {
@@ -349,6 +420,19 @@ void ApplicationStreams::acknowledged( const Frame& frame )
     }
     if ( f->fin )
       s.fin_acked = true;
+    retire_ready( f->stream_id );
+  } else if ( const auto* reset_frame = std::get_if<ResetStreamFrame>( &frame ) ) {
+    auto it = streams_.find( reset_frame->stream_id );
+    if ( it == streams_.end() )
+      return;
+    auto& s = it->second;
+    for ( const auto& [offset, bytes] : s.inflight ) {
+      (void)offset;
+      buffered_ -= bytes.size();
+    }
+    s.inflight.clear();
+    s.reset_acked = true;
+    retire_ready( reset_frame->stream_id );
   }
 }
 } // namespace quic

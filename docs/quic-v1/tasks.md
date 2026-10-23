@@ -23,7 +23,7 @@
 | --- | --- | --- |
 | 1–2 | 双栈 UDP/ECN 元数据、基础编码与核心帧格式、包号/包边界、VN/Retry 原语 | 会话恢复、模糊测试、VN/Retry 接受状态机与 token |
 | 3 | CRYPTO、真实 TLS 1.3、证书/ALPN/实际 CID 参数绑定、AES 包保护、单路径握手确认及密钥丢弃 | 其它套件、后握手处理与完整 RFC 安全边界 |
-| 4–5 | 可复用连接、可靠双向/单向应用流、FIN/RESET/STOP、流/连接额度和 MAX/BLOCKED | 流数量补额与终态回收、完整生命周期与关闭计时 |
+| 4–5 | 可复用连接、可靠双向/单向应用流、FIN/RESET/STOP、流/连接额度和 MAX/BLOCKED | 完整生命周期与关闭计时 |
 | 6 | 即时 ACK、有界发送历史、RTT、包号/时间阈值、PTO/退避、迟到 ACK、新包号重发握手帧 | ACK_ECN、CRYPTO 发送缓冲按 ACK 回收及完整 RFC 边界 |
 | 7 | 已接入物理在途字节、固定路径 NewReno、慢启动/拥塞避免及恢复期降窗、ACK/PTO 发送例外及有界 pacing | 持续拥塞、ECN 验证和完整 RFC 边界 |
 | 8 | 显式禁用 0-RTT/会话恢复 | 0-RTT 策略、会话恢复和应用 API |
@@ -37,3 +37,5 @@
 后续已接入有界令牌桶 pacing：速率随窗口与 RTT 调整，发送唤醒与恢复期限合并，纯 ACK/PTO 探测保留例外。当前实现与验证见 [pacing.md](pacing.md)。
 
 后续已接入有界可靠应用流、FIN/RESET/STOP 与流量控制，当前能力、API、资源限制和验证见 [application-streams.md](application-streams.md)。
+
+后续已实现流终态回收、紧凑关闭 ID 区间与可靠 MAX_STREAMS 补额，最新语义和验证见 [stream-retirement.md](stream-retirement.md)。
